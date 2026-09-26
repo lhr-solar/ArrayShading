@@ -12,6 +12,7 @@ namespace solar {
 void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
                  std::vector<Cell>& cells, Sun& sun,
                  SimulationSettings& settings, SimulationSummary& summary,
+                 std::vector<float>& shell_irradiance,
                  const std::filesystem::path& output_path);
 
 }  // namespace solar

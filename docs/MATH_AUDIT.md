@@ -111,6 +111,21 @@ P_incident,array = Σ P_incident,cell
 This is optical incident sunlight, not electrical output. Efficiency, temperature, strings,
 mismatch, bypass diodes, MPPT, and wiring are intentionally outside the current result.
 
+## Top-shell visualization
+
+For each consistently upward-wound STL triangle, a downward Embree ray at its centroid tests
+whether the triangle belongs to the upper geometric envelope. Accepted triangle centers use
+the same direct-beam visibility equation as cells. The displayed shell value is:
+
+```text
+E_shell,preview = DNI max(0, n dot s) visibility
+                  + DHI (1 + n_z) / 2
+```
+
+The direct term therefore includes hard self-shadowing by the full car STL. The diffuse term
+is an isotropic unobstructed-sky estimate; recursive reflected irradiance remains a cell-model
+quantity and is not included in the shell preview. Non-envelope triangles remain gray.
+
 ## Validation currently automated
 
 - Vector normalization and cross-product orientation.

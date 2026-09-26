@@ -220,11 +220,19 @@ int main(int argc, char** argv) {
     solar::write_cell_csv(options.output_path, cells);
     std::cout << "Wrote " << options.output_path << '\n';
     if (!options.headless) {
+      start = Clock::now();
+      std::cout << "Calculating top-shell irradiance heat map...\n";
+      std::vector<float> shell_irradiance =
+          solar::simulate_top_shell_irradiance(
+              mesh, scene, options.sun, options.simulation);
+      std::cout << "Shell heat map finished in " << elapsed_seconds(start)
+                << " s\n";
       std::cout << "Opening OpenGL viewer...\n";
       solar::Sun interactive_sun = options.sun;
       solar::SimulationSettings interactive_settings = options.simulation;
       solar::show_viewer(mesh, scene, cells, interactive_sun,
-                         interactive_settings, summary, options.output_path);
+                         interactive_settings, summary, shell_irradiance,
+                         options.output_path);
     }
     return 0;
   } catch (const std::exception& error) {

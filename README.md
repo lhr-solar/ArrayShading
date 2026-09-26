@@ -131,13 +131,15 @@ simulation. Its left control panel provides:
 - a **Run Simulation** button that recomputes Embree results;
 - current irradiance, incident optical watts, active area, and accepted-cell metrics;
 - direct/sky/reflected contribution breakdown;
-- irradiance color legend;
+- Embree-occluded top-shell irradiance heat map and color legend;
 - shell, cells, ground-grid, sun-vector, and wireframe toggles;
 - CSV export and camera reset.
 
 The right viewport renders the complete STL plus heat-colored cells. Left-drag orbits, the
-mouse wheel zooms, and Escape closes the application. The panel occupies its own screen area,
-so it does not cover the car.
+mouse wheel zooms in small bounded increments, and Escape closes the application. The panel
+occupies its own screen area, so it does not cover the car. The shell heat map evaluates the
+top-envelope triangle centers with exact Embree sun-visibility rays plus an isotropic diffuse
+sky estimate; gray geometry is outside that top envelope.
 
 ## Current optical model
 

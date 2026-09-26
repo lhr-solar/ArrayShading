@@ -47,11 +47,32 @@ in vec3 vColor;
 uniform vec3 uSunDirection;
 uniform bool uUnlit;
 uniform bool uCellPass;
+uniform bool uShellHeat;
+uniform samplerBuffer uShellIrradiance;
 out vec4 fragColor;
+
+vec3 irradianceColor(float irradiance) {
+  float t = clamp(irradiance / 1000.0, 0.0, 1.0);
+  if (t < 0.25) return vec3(0.04, 0.22 + 1.6 * t, 0.75 + t);
+  if (t < 0.5) return vec3(0.04, 0.62 + 0.9 * (t - 0.25),
+                           1.0 - 2.5 * (t - 0.25));
+  if (t < 0.75) return vec3(2.8 * (t - 0.5), 0.85,
+                            0.35 - 1.2 * (t - 0.5));
+  return vec3(0.70 + 1.2 * (t - 0.75),
+              0.85 - 2.2 * (t - 0.75), 0.05);
+}
+
 void main() {
   if (uUnlit) {
     fragColor = vec4(vColor, 1.0);
     return;
+  }
+  if (uShellHeat) {
+    float irradiance = texelFetch(uShellIrradiance, gl_PrimitiveID).r;
+    if (irradiance >= 0.0) {
+      fragColor = vec4(irradianceColor(irradiance), 1.0);
+      return;
+    }
   }
   vec3 normal = normalize(cross(dFdx(vWorld), dFdy(vWorld)));
   float incidence = abs(dot(normal, normalize(uSunDirection)));
@@ -248,8 +269,12 @@ void mouse_callback(GLFWwindow* window, int button, int action, int) {
 void scroll_callback(GLFWwindow* window, double, double y_offset) {
   auto* camera = static_cast<Camera*>(glfwGetWindowUserPointer(window));
   if (!camera || imgui_captures_mouse()) return;
-  camera->distance *= std::pow(0.88f, static_cast<float>(y_offset));
-  camera->distance = std::clamp(camera->distance, 0.25f, 100.0f);
+  const float steps =
+      std::clamp(static_cast<float>(y_offset), -2.0f, 2.0f);
+  camera->distance *= std::exp(-0.075f * steps);
+  camera->distance =
+      std::clamp(camera->distance, camera->home_distance * 0.12f,
+                 camera->home_distance * 6.0f);
 }
 
 void glfw_error(int, const char* description) {
@@ -318,7 +343,7 @@ void draw_label_value(const char* label, const std::string& value) {
 }
 
 void draw_heat_legend() {
-  ImGui::TextDisabled("CELL IRRADIANCE");
+  ImGui::TextDisabled("IRRADIANCE HEAT MAP");
   const ImVec2 start = ImGui::GetCursorScreenPos();
   const float width = ImGui::GetContentRegionAvail().x;
   constexpr float height = 13.0f;
@@ -354,6 +379,7 @@ std::string fixed(float value, int precision = 1) {
 void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
                  std::vector<Cell>& cells, Sun& sun,
                  SimulationSettings& settings, SimulationSummary& summary,
+                 std::vector<float>& shell_irradiance,
                  const std::filesystem::path& output_path) {
   glfwSetErrorCallback(glfw_error);
   if (!glfwInit()) throw std::runtime_error("GLFW initialization failed");
@@ -382,6 +408,7 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
   }
 
   GLuint shell_vao = 0, shell_vbo = 0;
+  GLuint shell_heat_buffer = 0, shell_heat_texture = 0;
   GLuint cells_vao = 0, cells_vbo = 0;
   GLuint outlines_vao = 0, outlines_vbo = 0;
   GLuint grid_vao = 0, grid_vbo = 0;
@@ -407,6 +434,28 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vec3), nullptr);
     glDisableVertexAttribArray(1);
     glVertexAttrib3f(1, 0.30f, 0.36f, 0.42f);
+
+    if (shell_irradiance.size() != mesh.triangle_count())
+      throw std::runtime_error("Shell heat map size does not match STL triangles");
+    GLint max_texture_buffer_texels = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE, &max_texture_buffer_texels);
+    if (shell_irradiance.size() >
+        static_cast<std::size_t>(max_texture_buffer_texels)) {
+      throw std::runtime_error(
+          "GPU texture-buffer limit is too small for the shell heat map");
+    }
+    glGenBuffers(1, &shell_heat_buffer);
+    glBindBuffer(GL_TEXTURE_BUFFER, shell_heat_buffer);
+    glBufferData(GL_TEXTURE_BUFFER,
+                 static_cast<GLsizeiptr>(shell_irradiance.size() *
+                                         sizeof(float)),
+                 shell_irradiance.data(), GL_DYNAMIC_DRAW);
+    if (glGetError() == GL_OUT_OF_MEMORY)
+      throw std::runtime_error(
+          "GPU could not hold the per-triangle shell heat map");
+    glGenTextures(1, &shell_heat_texture);
+    glBindTexture(GL_TEXTURE_BUFFER, shell_heat_texture);
+    glTexBuffer(GL_TEXTURE_BUFFER, GL_R32F, shell_heat_buffer);
 
     std::vector<RenderVertex> rendered_cells = cell_vertices(cells);
     std::vector<RenderVertex> rendered_outlines = cell_outlines(cells);
@@ -469,7 +518,8 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
     int ray_count = static_cast<int>(settings.hemisphere_samples);
     int reflection_depth = static_cast<int>(settings.max_reflection_depth);
     bool show_shell = true;
-    bool show_cells = true;
+    bool show_shell_heat = true;
+    bool show_cells = false;
     bool show_grid = true;
     bool show_sun = true;
     bool wireframe = false;
@@ -546,11 +596,18 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       if (ImGui::Button("RUN SIMULATION", {-1.0f, 42.0f})) {
         const auto start = std::chrono::steady_clock::now();
         summary = simulate_cells(cells, scene, sun, settings);
+        shell_irradiance =
+            simulate_top_shell_irradiance(mesh, scene, sun, settings);
         breakdown = calculate_breakdown(cells);
         rendered_cells = cell_vertices(cells);
         rendered_outlines = cell_outlines(cells);
         upload_vertices(cells_vbo, rendered_cells);
         upload_vertices(outlines_vbo, rendered_outlines);
+        glBindBuffer(GL_TEXTURE_BUFFER, shell_heat_buffer);
+        glBufferSubData(GL_TEXTURE_BUFFER, 0,
+                        static_cast<GLsizeiptr>(shell_irradiance.size() *
+                                                sizeof(float)),
+                        shell_irradiance.data());
         write_cell_csv(output_path, cells);
         const double seconds = std::chrono::duration<double>(
                                    std::chrono::steady_clock::now() - start)
@@ -578,12 +635,13 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       ImGui::TextDisabled("VIEW");
       ImGui::Checkbox("Shell", &show_shell);
       ImGui::SameLine(112.0f);
-      ImGui::Checkbox("Cells", &show_cells);
-      ImGui::SameLine(220.0f);
       ImGui::Checkbox("Grid", &show_grid);
-      ImGui::Checkbox("Sun direction", &show_sun);
-      ImGui::SameLine(180.0f);
+      ImGui::SameLine(220.0f);
       ImGui::Checkbox("Wireframe", &wireframe);
+      ImGui::Checkbox("Shell heat map", &show_shell_heat);
+      ImGui::Checkbox("Candidate cells", &show_cells);
+      ImGui::SameLine(180.0f);
+      ImGui::Checkbox("Sun direction", &show_sun);
       if (ImGui::Button("Reset camera", {-1.0f, 0.0f})) camera.reset();
 
       ImGui::Spacing();
@@ -628,9 +686,13 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       glUniform3f(glGetUniformLocation(program, "uSunDirection"),
                   sun.direction_to_sun.x, sun.direction_to_sun.y,
                   sun.direction_to_sun.z);
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_BUFFER, shell_heat_texture);
+      glUniform1i(glGetUniformLocation(program, "uShellIrradiance"), 0);
 
       glUniform1i(glGetUniformLocation(program, "uUnlit"), GL_TRUE);
       glUniform1i(glGetUniformLocation(program, "uCellPass"), GL_FALSE);
+      glUniform1i(glGetUniformLocation(program, "uShellHeat"), GL_FALSE);
       if (show_grid) {
         glBindVertexArray(grid_vao);
         glLineWidth(1.0f);
@@ -640,6 +702,8 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       if (show_shell) {
         glUniform1i(glGetUniformLocation(program, "uUnlit"), GL_FALSE);
         glUniform1i(glGetUniformLocation(program, "uCellPass"), GL_FALSE);
+        glUniform1i(glGetUniformLocation(program, "uShellHeat"),
+                    show_shell_heat ? GL_TRUE : GL_FALSE);
         glBindVertexArray(shell_vao);
         if (wireframe) glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
         glDrawArrays(GL_TRIANGLES, 0,
@@ -652,6 +716,7 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
         glPolygonOffset(-1.0f, -1.0f);
         glUniform1i(glGetUniformLocation(program, "uUnlit"), GL_FALSE);
         glUniform1i(glGetUniformLocation(program, "uCellPass"), GL_TRUE);
+        glUniform1i(glGetUniformLocation(program, "uShellHeat"), GL_FALSE);
         glBindVertexArray(cells_vao);
         glDrawArrays(GL_TRIANGLES, 0,
                      static_cast<GLsizei>(rendered_cells.size()));
@@ -685,6 +750,8 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       ImGui::DestroyContext();
     }
     if (program) glDeleteProgram(program);
+    if (shell_heat_texture) glDeleteTextures(1, &shell_heat_texture);
+    if (shell_heat_buffer) glDeleteBuffers(1, &shell_heat_buffer);
     for (GLuint buffer : {shell_vbo, cells_vbo, outlines_vbo, grid_vbo, sun_vbo})
       if (buffer) glDeleteBuffers(1, &buffer);
     for (GLuint array : {shell_vao, cells_vao, outlines_vao, grid_vao, sun_vao})
@@ -698,6 +765,8 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
   ImGui_ImplGlfw_Shutdown();
   ImGui::DestroyContext();
   glDeleteProgram(program);
+  glDeleteTextures(1, &shell_heat_texture);
+  glDeleteBuffers(1, &shell_heat_buffer);
   for (GLuint buffer : {shell_vbo, cells_vbo, outlines_vbo, grid_vbo, sun_vbo})
     glDeleteBuffers(1, &buffer);
   for (GLuint array : {shell_vao, cells_vao, outlines_vao, grid_vao, sun_vao})
