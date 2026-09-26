@@ -1,0 +1,7 @@
+build/
+vcpkg_installed/
+CMakeUserPresets.json
+results/
+*.csv
+*.stl
+.DS_Store

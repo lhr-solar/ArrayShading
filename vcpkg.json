@@ -1,0 +1,17 @@
+{
+  "name": "solar-whitted-cpp",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "embree",
+    "glew",
+    "glfw3",
+    "glm",
+    {
+      "name": "imgui",
+      "features": [
+        "glfw-binding",
+        "opengl3-binding"
+      ]
+    }
+  ]
+}

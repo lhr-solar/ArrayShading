@@ -1,0 +1,73 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Configure release build",
+      "type": "shell",
+      "command": "cmake",
+      "args": ["--preset", "release-vcpkg"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Build simulator",
+      "type": "shell",
+      "command": "cmake",
+      "args": ["--build", "--preset", "release-vcpkg"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "dependsOn": "Configure release build",
+      "group": {"kind": "build", "isDefault": true},
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Run C++ tests",
+      "type": "shell",
+      "command": "ctest",
+      "args": ["--preset", "release-vcpkg"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "dependsOn": "Build simulator",
+      "group": {"kind": "test", "isDefault": true},
+      "problemMatcher": []
+    },
+    {
+      "label": "Run full-mesh simulator",
+      "type": "shell",
+      "command": "${workspaceFolder}/build/release/solar_whitted_cpp",
+      "windows": {
+        "command": "${workspaceFolder}\\build\\release\\solar_whitted_cpp.exe"
+      },
+      "args": [
+        "--stl", "${input:carStlPath}",
+        "--rays", "64",
+        "--output", "${workspaceFolder}/results/cell-irradiance.csv"
+      ],
+      "options": {"cwd": "${workspaceFolder}"},
+      "dependsOn": "Build simulator",
+      "problemMatcher": []
+    },
+    {
+      "label": "Run headless simulation",
+      "type": "shell",
+      "command": "${workspaceFolder}/build/release/solar_whitted_cpp",
+      "windows": {
+        "command": "${workspaceFolder}\\build\\release\\solar_whitted_cpp.exe"
+      },
+      "args": [
+        "--stl", "${input:carStlPath}",
+        "--rays", "128",
+        "--headless",
+        "--output", "${workspaceFolder}/results/cell-irradiance.csv"
+      ],
+      "options": {"cwd": "${workspaceFolder}"},
+      "dependsOn": "Build simulator",
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "carStlPath",
+      "type": "promptString",
+      "description": "Absolute path to _24-000.stl"
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+cmake_minimum_required(VERSION 3.24)
+project(solar_whitted_cpp VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+find_package(embree 4 CONFIG REQUIRED)
+find_package(glfw3 CONFIG REQUIRED)
+find_package(glm CONFIG REQUIRED)
+find_package(GLEW REQUIRED)
+find_package(imgui CONFIG REQUIRED)
+find_package(OpenGL REQUIRED)
+
+add_library(solar_mesh src/stl_mesh.cpp)
+target_include_directories(solar_mesh PUBLIC include)
+
+add_library(solar_trace src/trace_scene.cpp src/simulation.cpp)
+target_include_directories(solar_trace PUBLIC include)
+target_link_libraries(solar_trace PUBLIC solar_mesh embree)
+
+add_library(solar_viewer src/viewer.cpp)
+target_include_directories(solar_viewer PUBLIC include)
+target_link_libraries(solar_viewer PUBLIC solar_trace glfw glm::glm GLEW::GLEW imgui::imgui OpenGL::GL)
+
+add_executable(solar_whitted_cpp src/main.cpp)
+target_link_libraries(solar_whitted_cpp PRIVATE solar_viewer)
+
+if(MSVC)
+  target_compile_options(solar_mesh PRIVATE /W4 /permissive- /utf-8)
+  target_compile_options(solar_trace PRIVATE /W4 /permissive- /utf-8)
+  target_compile_options(solar_viewer PRIVATE /W4 /permissive- /utf-8)
+else()
+  target_compile_options(solar_mesh PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(solar_trace PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(solar_viewer PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(solar_core_tests tests/core_tests.cpp)
+  target_link_libraries(solar_core_tests PRIVATE solar_trace)
+  add_test(NAME solar_core_tests COMMAND solar_core_tests)
+endif()

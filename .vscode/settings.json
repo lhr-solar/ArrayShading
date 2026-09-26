@@ -1,0 +1,9 @@
+{
+  "cmake.sourceDirectory": "${workspaceFolder}",
+  "cmake.useCMakePresets": "always",
+  "cmake.configureOnOpen": false,
+  "editor.formatOnSave": true,
+  "files.associations": {
+    "*.hpp": "cpp"
+  }
+}

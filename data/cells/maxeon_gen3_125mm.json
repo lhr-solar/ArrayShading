@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "manufacturer": "SunPower",
+  "family": "Maxeon Gen III",
+  "datasheet_document": "507816 Rev F / A4_EN",
+  "datasheet_url": "https://www.enfsolar.com/Product/pdf/Cell/5b91fcf3916df.pdf",
+  "default_bin": "Me1",
+  "stc": {
+    "irradiance_w_m2": 1000.0,
+    "cell_temperature_c": 25.0,
+    "spectrum": "AM1.5G"
+  },
+  "geometry": {
+    "bounding_width_m": 0.125,
+    "bounding_height_m": 0.125,
+    "active_area_m2": 0.0153,
+    "diagonal_m": 0.160,
+    "thickness_m": 0.00015,
+    "thickness_tolerance_m": 0.00003,
+    "cell_mass_kg": 0.0065,
+    "interconnect_tab_mass_kg": 0.0003
+  },
+  "construction": {
+    "wafer": "monocrystalline silicon",
+    "design": "all-back-contact IBC",
+    "front": "uniform black antireflection coating",
+    "back": "tin-coated copper metal grid",
+    "bond_pad_width_m": 0.0054,
+    "bond_pad_height_m": 0.0030,
+    "metal_finger_pitch_m": 0.000471,
+    "grounding_note": "Datasheet recommends positive electrical grounding; consult Maxeon if the system cannot use it."
+  },
+  "bins": {
+    "Me1": {
+      "description": "Ultra Peak Performance",
+      "pmpp_w": 3.72,
+      "efficiency_fraction": 0.243,
+      "vmpp_v": 0.632,
+      "impp_a": 5.89,
+      "voc_v": 0.730,
+      "isc_a": 6.18,
+      "fill_factor_fraction_derived": 0.8246
+    },
+    "Le1": {
+      "description": "Ultra Premium Performance",
+      "pmpp_w": 3.63,
+      "efficiency_fraction": 0.237,
+      "vmpp_v": 0.621,
+      "impp_a": 5.84,
+      "voc_v": 0.721,
+      "isc_a": 6.15,
+      "fill_factor_fraction_derived": 0.8186
+    },
+    "Ke1": {
+      "description": "Ultra High Performance",
+      "pmpp_w": 3.54,
+      "efficiency_fraction": 0.231,
+      "vmpp_v": 0.612,
+      "impp_a": 5.79,
+      "voc_v": 0.713,
+      "isc_a": 6.11,
+      "fill_factor_fraction_derived": 0.8126
+    }
+  },
+  "temperature_coefficients": {
+    "source_scope": "published as coefficients in SunPower panels; use provisionally for bare-cell modeling",
+    "voltage_v_per_c": -0.00174,
+    "current_a_per_c": 0.0029,
+    "power_fraction_per_c": -0.0029
+  },
+  "published_but_not_digitized": {
+    "spectral_response": "Graph from approximately 300 to 1200 nm in the source datasheet; no numeric table published."
+  },
+  "missing_for_calibrated_electrical_model": [
+    "series resistance Rs at relevant irradiance and temperature",
+    "shunt resistance Rsh at relevant irradiance and temperature",
+    "diode ideality factor or nNsVth",
+    "dark saturation current I0",
+    "reverse-bias and breakdown I-V curve",
+    "low-light I-V curves",
+    "incidence-angle modifier for the actual encapsulation stack",
+    "encapsulant and cover-layer optical transmittance",
+    "cell thermal resistance and heat capacity in the vehicle laminate",
+    "manufacturing-bin distribution for the cells actually installed",
+    "interconnect resistance",
+    "string topology and bypass-diode forward model"
+  ]
+}
