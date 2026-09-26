@@ -41,8 +41,10 @@ Windows. Then open the repository in VS Code and run this one command in its ter
 .\run_windows.bat
 ```
 
-The launcher finds Visual Studio, initializes MSVC, installs/bootstrap vcpkg when necessary,
-builds the project, and opens the GUI using
+The launcher finds Visual Studio and automatically installs missing MSVC/Windows SDK, CMake,
+Ninja, Git, vcpkg, Embree, GLFW, GLEW, GLM, and Dear ImGui dependencies. Windows may show an
+administrator prompt while system build tools are installed. It then builds the project and
+opens the GUI using
 `%USERPROFILE%\Downloads\_24-000.stl`. A different STL can be supplied as the first argument:
 
 ```powershell
