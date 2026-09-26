@@ -1,7 +1,5 @@
 #include "solar/simulation.hpp"
 
-#include "solar/stl_mesh.hpp"
-
 #include <atomic>
 #include <cmath>
 #include <fstream>
@@ -211,71 +209,6 @@ SimulationSummary simulate_cells(std::vector<Cell>& cells, const TraceScene& sce
   result.area_weighted_irradiance_w_m2 =
       result.incident_solar_power_w / result.active_area_m2;
   return result;
-}
-
-std::vector<float> simulate_top_shell_irradiance(
-    const TriangleMesh& mesh, const TraceScene& scene, const Sun& sun,
-    const SimulationSettings& settings) {
-  const std::size_t triangle_count = mesh.triangle_count();
-  std::vector<float> irradiance(triangle_count, -1.0f);
-  if (triangle_count == 0) return irradiance;
-
-  const float start_z = mesh.bounds.maximum.z + 1.0f;
-  const float envelope_tolerance =
-      std::max(0.002f, mesh.bounds.extent().z * 1.0e-5f);
-  const std::uint32_t hardware =
-      std::max(1U, std::thread::hardware_concurrency());
-  const std::uint32_t thread_count =
-      std::max(1U, settings.worker_threads == 0 ? hardware
-                                                : settings.worker_threads);
-  constexpr std::size_t kChunkSize = 1024U;
-  std::atomic<std::size_t> next{0};
-  std::vector<std::thread> workers;
-  workers.reserve(thread_count);
-
-  for (std::uint32_t thread = 0; thread < thread_count; ++thread) {
-    workers.emplace_back([&] {
-      while (true) {
-        const std::size_t begin =
-            next.fetch_add(kChunkSize, std::memory_order_relaxed);
-        if (begin >= triangle_count) break;
-        const std::size_t end = std::min(begin + kChunkSize, triangle_count);
-        for (std::size_t triangle = begin; triangle < end; ++triangle) {
-          const std::size_t first = triangle * 3U;
-          const Vec3 edge_a =
-              mesh.vertices[first + 1U] - mesh.vertices[first];
-          const Vec3 edge_b =
-              mesh.vertices[first + 2U] - mesh.vertices[first];
-          const Vec3 raw_normal = cross(edge_a, edge_b);
-          if (raw_normal.z <= 0.0f) continue;
-          const Vec3 center = (mesh.vertices[first] + mesh.vertices[first + 1U] +
-                               mesh.vertices[first + 2U]) /
-                              3.0f;
-          const auto top = top_hit(scene, center.x, center.y, start_z);
-          if (!top || std::abs(top->point.z - center.z) > envelope_tolerance ||
-              top->normal.z <= 0.05f) {
-            continue;
-          }
-
-          const float cosine =
-              std::max(0.0f, dot(top->normal, sun.direction_to_sun));
-          float direct = 0.0f;
-          const Vec3 origin =
-              top->point + top->normal * settings.ray_epsilon_m;
-          if (cosine > 0.0f &&
-              scene.visible(origin, sun.direction_to_sun,
-                            settings.ray_epsilon_m, 1.0e30f, kCarMask)) {
-            direct = sun.dni_w_m2 * cosine;
-          }
-          const float sky_view =
-              std::clamp((1.0f + top->normal.z) * 0.5f, 0.0f, 1.0f);
-          irradiance[triangle] = direct + sun.dhi_w_m2 * sky_view;
-        }
-      }
-    });
-  }
-  for (auto& worker : workers) worker.join();
-  return irradiance;
 }
 
 void write_cell_csv(const std::filesystem::path& path,

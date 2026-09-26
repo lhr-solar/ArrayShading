@@ -14,9 +14,8 @@
 - Multithreaded cell evaluation and CSV export.
 - Native GLFW/OpenGL/Dear ImGui desktop application rendering the same full triangle buffer
   used by the solver.
-- Per-triangle top-envelope shell heat map with Embree direct-shadow tests, diffuse-sky
-  magnitude, asynchronous calculation, cursor readout, GPU texture-buffer coloring, and
-  bounded fine-grained camera zoom.
+- Lightweight live OpenGL shell irradiance preview with cursor readout and bounded
+  fine-grained camera zoom; no per-triangle CPU/GPU heat buffer is allocated.
 - Interactive sun/DNI/DHI, ray-count, recursion-depth, rerun, export, camera, heat legend,
   contribution breakdown, and display controls.
 - CMake/vcpkg build, VS Code tasks, and deterministic C++ core tests.
@@ -25,7 +24,8 @@
 
 The current result is optical irradiance and incident optical watts. The automatic grid is a
 placement preview, not the final array design. Shell and ground optical properties are still
-provisional scalar Lambert/Phong parameters.
+provisional scalar Lambert/Phong parameters. Live shell coloring is an orientation preview;
+validated occlusion and recursive reflection values are the Embree candidate-cell results.
 
 ## Next engineering inputs
 

@@ -15,7 +15,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
-#include <future>
 #include <iomanip>
 #include <iostream>
 #include <optional>
@@ -51,7 +50,8 @@ uniform vec3 uSunDirection;
 uniform bool uUnlit;
 uniform bool uCellPass;
 uniform bool uShellHeat;
-uniform samplerBuffer uShellIrradiance;
+uniform float uDni;
+uniform float uDhi;
 out vec4 fragColor;
 
 vec3 irradianceColor(float irradiance) {
@@ -70,15 +70,15 @@ void main() {
     fragColor = vec4(vColor, 1.0);
     return;
   }
-  if (uShellHeat) {
-    float irradiance = texelFetch(uShellIrradiance, gl_PrimitiveID).r;
-    if (irradiance >= 0.0) {
-      fragColor = vec4(irradianceColor(irradiance), 1.0);
-      return;
-    }
-  }
   vec3 normal = normalize(cross(dFdx(vWorld), dFdy(vWorld)));
-  float incidence = abs(dot(normal, normalize(uSunDirection)));
+  if (normal.z < 0.0) normal = -normal;
+  if (uShellHeat) {
+    float direct = uDni * max(0.0, dot(normal, normalize(uSunDirection)));
+    float sky = uDhi * clamp((1.0 + normal.z) * 0.5, 0.0, 1.0);
+    fragColor = vec4(irradianceColor(direct + sky), 1.0);
+    return;
+  }
+  float incidence = max(0.0, dot(normal, normalize(uSunDirection)));
   float lighting = uCellPass ? 0.78 + 0.22 * incidence
                              : 0.24 + 0.76 * incidence;
   fragColor = vec4(vColor * lighting, 1.0);
@@ -382,7 +382,6 @@ std::string fixed(float value, int precision = 1) {
 void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
                  std::vector<Cell>& cells, Sun& sun,
                  SimulationSettings& settings, SimulationSummary& summary,
-                 std::vector<float>& shell_irradiance,
                  const std::filesystem::path& output_path) {
   glfwSetErrorCallback(glfw_error);
   if (!glfwInit()) throw std::runtime_error("GLFW initialization failed");
@@ -411,7 +410,6 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
   }
 
   GLuint shell_vao = 0, shell_vbo = 0;
-  GLuint shell_heat_buffer = 0, shell_heat_texture = 0;
   GLuint cells_vao = 0, cells_vbo = 0;
   GLuint outlines_vao = 0, outlines_vbo = 0;
   GLuint grid_vao = 0, grid_vbo = 0;
@@ -437,28 +435,6 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vec3), nullptr);
     glDisableVertexAttribArray(1);
     glVertexAttrib3f(1, 0.30f, 0.36f, 0.42f);
-
-    if (shell_irradiance.size() != mesh.triangle_count())
-      throw std::runtime_error("Shell heat map size does not match STL triangles");
-    GLint max_texture_buffer_texels = 0;
-    glGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE, &max_texture_buffer_texels);
-    if (shell_irradiance.size() >
-        static_cast<std::size_t>(max_texture_buffer_texels)) {
-      throw std::runtime_error(
-          "GPU texture-buffer limit is too small for the shell heat map");
-    }
-    glGenBuffers(1, &shell_heat_buffer);
-    glBindBuffer(GL_TEXTURE_BUFFER, shell_heat_buffer);
-    glBufferData(GL_TEXTURE_BUFFER,
-                 static_cast<GLsizeiptr>(shell_irradiance.size() *
-                                         sizeof(float)),
-                 shell_irradiance.data(), GL_DYNAMIC_DRAW);
-    if (glGetError() == GL_OUT_OF_MEMORY)
-      throw std::runtime_error(
-          "GPU could not hold the per-triangle shell heat map");
-    glGenTextures(1, &shell_heat_texture);
-    glBindTexture(GL_TEXTURE_BUFFER, shell_heat_texture);
-    glTexBuffer(GL_TEXTURE_BUFFER, GL_R32F, shell_heat_buffer);
 
     std::vector<RenderVertex> rendered_cells = cell_vertices(cells);
     std::vector<RenderVertex> rendered_outlines = cell_outlines(cells);
@@ -527,36 +503,14 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
     bool show_sun = true;
     bool wireframe = false;
     bool inputs_dirty = false;
-    std::string status = "Calculating shell heat map...";
+    std::string status = "Simulation ready";
     Breakdown breakdown = calculate_breakdown(cells);
     std::optional<float> hovered_shell_irradiance;
-    auto shell_heat_started = std::chrono::steady_clock::now();
-    std::future<std::vector<float>> shell_heat_future = std::async(
-        std::launch::async, [&mesh, &scene, sun, settings] {
-          return simulate_top_shell_irradiance(mesh, scene, sun, settings);
-        });
 
     while (!glfwWindowShouldClose(window)) {
       glfwPollEvents();
       if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
         glfwSetWindowShouldClose(window, GLFW_TRUE);
-
-      if (shell_heat_future.valid() &&
-          shell_heat_future.wait_for(std::chrono::milliseconds(0)) ==
-              std::future_status::ready) {
-        shell_irradiance = shell_heat_future.get();
-        glBindBuffer(GL_TEXTURE_BUFFER, shell_heat_buffer);
-        glBufferSubData(GL_TEXTURE_BUFFER, 0,
-                        static_cast<GLsizeiptr>(shell_irradiance.size() *
-                                                sizeof(float)),
-                        shell_irradiance.data());
-        const double seconds = std::chrono::duration<double>(
-                                   std::chrono::steady_clock::now() -
-                                   shell_heat_started)
-                                   .count();
-        status = "Shell heat map ready in " +
-                 fixed(static_cast<float>(seconds), 2) + " s";
-      }
 
       ImGui_ImplOpenGL3_NewFrame();
       ImGui_ImplGlfw_NewFrame();
@@ -615,14 +569,11 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
 
       if (inputs_dirty)
         ImGui::TextColored({0.98f, 0.67f, 0.20f, 1.0f},
-                           "Inputs changed - run to refresh heat map");
+                           "Inputs changed - run to refresh cell results");
       else
         ImGui::TextColored({0.35f, 0.80f, 0.55f, 1.0f}, "%s", status.c_str());
 
-      const bool shell_heat_busy = shell_heat_future.valid();
-      if (shell_heat_busy) ImGui::BeginDisabled();
-      if (ImGui::Button("RUN SIMULATION", {-1.0f, 42.0f}) &&
-          !shell_heat_busy) {
+      if (ImGui::Button("RUN SIMULATION", {-1.0f, 42.0f})) {
         const auto start = std::chrono::steady_clock::now();
         summary = simulate_cells(cells, scene, sun, settings);
         breakdown = calculate_breakdown(cells);
@@ -634,21 +585,9 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
         const double seconds = std::chrono::duration<double>(
                                    std::chrono::steady_clock::now() - start)
                                    .count();
-        const Sun shell_sun = sun;
-        const SimulationSettings shell_settings = settings;
-        shell_heat_started = std::chrono::steady_clock::now();
-        shell_heat_future = std::async(
-            std::launch::async,
-            [&mesh, &scene, shell_sun, shell_settings] {
-              return simulate_top_shell_irradiance(
-                  mesh, scene, shell_sun, shell_settings);
-            });
-        status = "Cells completed in " +
-                 fixed(static_cast<float>(seconds), 2) +
-                 " s; calculating shell...";
+        status = "Completed in " + fixed(static_cast<float>(seconds), 2) + " s";
         inputs_dirty = false;
       }
-      if (shell_heat_busy) ImGui::EndDisabled();
       if (ImGui::Button("Export current CSV", {-1.0f, 0.0f})) {
         write_cell_csv(output_path, cells);
         status = "CSV exported";
@@ -665,12 +604,10 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       ImGui::Spacing();
       draw_heat_legend();
       if (hovered_shell_irradiance) {
-        draw_label_value("Shell under cursor",
+        draw_label_value("Live shell preview",
                          fixed(*hovered_shell_irradiance, 1) + " W/m2");
-      } else if (shell_heat_busy) {
-        ImGui::TextDisabled("Shell values are calculating...");
       } else {
-        ImGui::TextDisabled("Hover over the top shell for exact W/m2");
+        ImGui::TextDisabled("Hover over the shell for live preview W/m2");
       }
 
       ImGui::Spacing();
@@ -680,7 +617,7 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       ImGui::Checkbox("Grid", &show_grid);
       ImGui::SameLine(220.0f);
       ImGui::Checkbox("Wireframe", &wireframe);
-      ImGui::Checkbox("Shell heat map", &show_shell_heat);
+      ImGui::Checkbox("Live shell heat", &show_shell_heat);
       ImGui::Checkbox("Candidate cells", &show_cells);
       ImGui::SameLine(180.0f);
       ImGui::Checkbox("Sun direction", &show_sun);
@@ -744,9 +681,16 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
         const auto hit = scene.intersect(
             {eye.x, eye.y, eye.z}, {ray.x, ray.y, ray.z},
             settings.ray_epsilon_m, 1.0e30f, kCarMask);
-        if (hit && hit->primitive_id < shell_irradiance.size()) {
-          const float value = shell_irradiance[hit->primitive_id];
-          if (value >= 0.0f) hovered_shell_irradiance = value;
+        if (hit) {
+          Vec3 normal = hit->normal;
+          if (normal.z < 0.0f) normal = -normal;
+          const float direct =
+              sun.dni_w_m2 *
+              std::max(0.0f, dot(normal, sun.direction_to_sun));
+          const float sky =
+              sun.dhi_w_m2 *
+              std::clamp((1.0f + normal.z) * 0.5f, 0.0f, 1.0f);
+          hovered_shell_irradiance = direct + sky;
         }
       }
 
@@ -756,9 +700,8 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       glUniform3f(glGetUniformLocation(program, "uSunDirection"),
                   sun.direction_to_sun.x, sun.direction_to_sun.y,
                   sun.direction_to_sun.z);
-      glActiveTexture(GL_TEXTURE0);
-      glBindTexture(GL_TEXTURE_BUFFER, shell_heat_texture);
-      glUniform1i(glGetUniformLocation(program, "uShellIrradiance"), 0);
+      glUniform1f(glGetUniformLocation(program, "uDni"), sun.dni_w_m2);
+      glUniform1f(glGetUniformLocation(program, "uDhi"), sun.dhi_w_m2);
 
       glUniform1i(glGetUniformLocation(program, "uUnlit"), GL_TRUE);
       glUniform1i(glGetUniformLocation(program, "uCellPass"), GL_FALSE);
@@ -820,8 +763,6 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       ImGui::DestroyContext();
     }
     if (program) glDeleteProgram(program);
-    if (shell_heat_texture) glDeleteTextures(1, &shell_heat_texture);
-    if (shell_heat_buffer) glDeleteBuffers(1, &shell_heat_buffer);
     for (GLuint buffer : {shell_vbo, cells_vbo, outlines_vbo, grid_vbo, sun_vbo})
       if (buffer) glDeleteBuffers(1, &buffer);
     for (GLuint array : {shell_vao, cells_vao, outlines_vao, grid_vao, sun_vao})
@@ -835,8 +776,6 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
   ImGui_ImplGlfw_Shutdown();
   ImGui::DestroyContext();
   glDeleteProgram(program);
-  glDeleteTextures(1, &shell_heat_texture);
-  glDeleteBuffers(1, &shell_heat_buffer);
   for (GLuint buffer : {shell_vbo, cells_vbo, outlines_vbo, grid_vbo, sun_vbo})
     glDeleteBuffers(1, &buffer);
   for (GLuint array : {shell_vao, cells_vao, outlines_vao, grid_vao, sun_vao})

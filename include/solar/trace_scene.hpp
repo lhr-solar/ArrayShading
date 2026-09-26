@@ -24,7 +24,6 @@ struct Hit {
   Vec3 point;
   Vec3 normal;
   std::uint32_t geometry_id = 0;
-  std::uint32_t primitive_id = 0;
   Material material;
 };
 

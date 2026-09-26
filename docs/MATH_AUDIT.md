@@ -113,18 +113,18 @@ mismatch, bypass diodes, MPPT, and wiring are intentionally outside the current 
 
 ## Top-shell visualization
 
-For each consistently upward-wound STL triangle, a downward Embree ray at its centroid tests
-whether the triangle belongs to the upper geometric envelope. Accepted triangle centers use
-the same direct-beam visibility equation as cells. The displayed shell value is:
+The native GUI provides an immediate orientation preview directly in the OpenGL fragment
+shader. For each displayed fragment it evaluates:
 
 ```text
-E_shell,preview = DNI max(0, n dot s) visibility
-                  + DHI (1 + n_z) / 2
+E_shell,preview = DNI max(0, n dot s) + DHI (1 + n_z) / 2
 ```
 
-The direct term therefore includes hard self-shadowing by the full car STL. The diffuse term
-is an isotropic unobstructed-sky estimate; recursive reflected irradiance remains a cell-model
-quantity and is not included in the shell preview. Non-envelope triangles remain gray.
+This visualization updates continuously as GUI sliders move and does not allocate a second
+full-mesh irradiance buffer. It intentionally excludes visibility, recursive reflections, and
+eligible-shell classification. It is therefore a visual orientation diagnostic, not a solver
+output. The candidate-cell values and exported CSV continue to use Embree visibility,
+hemisphere integration, and recursive reflection.
 
 ## Validation currently automated
 

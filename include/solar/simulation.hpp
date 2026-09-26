@@ -9,8 +9,6 @@
 
 namespace solar {
 
-struct TriangleMesh;
-
 struct Sun {
   Vec3 direction_to_sun = normalized({0.25f, -0.18f, 0.951f});
   float dni_w_m2 = 850.0f;
@@ -70,10 +68,6 @@ std::vector<Cell> project_cells(const TraceScene& scene, const Bounds& car_bound
 SimulationSummary simulate_cells(std::vector<Cell>& cells, const TraceScene& scene,
                                  const Sun& sun,
                                  const SimulationSettings& settings);
-
-std::vector<float> simulate_top_shell_irradiance(
-    const TriangleMesh& mesh, const TraceScene& scene, const Sun& sun,
-    const SimulationSettings& settings);
 
 void write_cell_csv(const std::filesystem::path& path,
                     const std::vector<Cell>& cells);
