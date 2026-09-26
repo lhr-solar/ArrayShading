@@ -4,6 +4,7 @@
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
@@ -14,8 +15,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <future>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -524,13 +527,36 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
     bool show_sun = true;
     bool wireframe = false;
     bool inputs_dirty = false;
-    std::string status = "Simulation ready";
+    std::string status = "Calculating shell heat map...";
     Breakdown breakdown = calculate_breakdown(cells);
+    std::optional<float> hovered_shell_irradiance;
+    auto shell_heat_started = std::chrono::steady_clock::now();
+    std::future<std::vector<float>> shell_heat_future = std::async(
+        std::launch::async, [&mesh, &scene, sun, settings] {
+          return simulate_top_shell_irradiance(mesh, scene, sun, settings);
+        });
 
     while (!glfwWindowShouldClose(window)) {
       glfwPollEvents();
       if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
         glfwSetWindowShouldClose(window, GLFW_TRUE);
+
+      if (shell_heat_future.valid() &&
+          shell_heat_future.wait_for(std::chrono::milliseconds(0)) ==
+              std::future_status::ready) {
+        shell_irradiance = shell_heat_future.get();
+        glBindBuffer(GL_TEXTURE_BUFFER, shell_heat_buffer);
+        glBufferSubData(GL_TEXTURE_BUFFER, 0,
+                        static_cast<GLsizeiptr>(shell_irradiance.size() *
+                                                sizeof(float)),
+                        shell_irradiance.data());
+        const double seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() -
+                                   shell_heat_started)
+                                   .count();
+        status = "Shell heat map ready in " +
+                 fixed(static_cast<float>(seconds), 2) + " s";
+      }
 
       ImGui_ImplOpenGL3_NewFrame();
       ImGui_ImplGlfw_NewFrame();
@@ -593,28 +619,36 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       else
         ImGui::TextColored({0.35f, 0.80f, 0.55f, 1.0f}, "%s", status.c_str());
 
-      if (ImGui::Button("RUN SIMULATION", {-1.0f, 42.0f})) {
+      const bool shell_heat_busy = shell_heat_future.valid();
+      if (shell_heat_busy) ImGui::BeginDisabled();
+      if (ImGui::Button("RUN SIMULATION", {-1.0f, 42.0f}) &&
+          !shell_heat_busy) {
         const auto start = std::chrono::steady_clock::now();
         summary = simulate_cells(cells, scene, sun, settings);
-        shell_irradiance =
-            simulate_top_shell_irradiance(mesh, scene, sun, settings);
         breakdown = calculate_breakdown(cells);
         rendered_cells = cell_vertices(cells);
         rendered_outlines = cell_outlines(cells);
         upload_vertices(cells_vbo, rendered_cells);
         upload_vertices(outlines_vbo, rendered_outlines);
-        glBindBuffer(GL_TEXTURE_BUFFER, shell_heat_buffer);
-        glBufferSubData(GL_TEXTURE_BUFFER, 0,
-                        static_cast<GLsizeiptr>(shell_irradiance.size() *
-                                                sizeof(float)),
-                        shell_irradiance.data());
         write_cell_csv(output_path, cells);
         const double seconds = std::chrono::duration<double>(
                                    std::chrono::steady_clock::now() - start)
                                    .count();
-        status = "Completed in " + fixed(static_cast<float>(seconds), 2) + " s";
+        const Sun shell_sun = sun;
+        const SimulationSettings shell_settings = settings;
+        shell_heat_started = std::chrono::steady_clock::now();
+        shell_heat_future = std::async(
+            std::launch::async,
+            [&mesh, &scene, shell_sun, shell_settings] {
+              return simulate_top_shell_irradiance(
+                  mesh, scene, shell_sun, shell_settings);
+            });
+        status = "Cells completed in " +
+                 fixed(static_cast<float>(seconds), 2) +
+                 " s; calculating shell...";
         inputs_dirty = false;
       }
+      if (shell_heat_busy) ImGui::EndDisabled();
       if (ImGui::Button("Export current CSV", {-1.0f, 0.0f})) {
         write_cell_csv(output_path, cells);
         status = "CSV exported";
@@ -630,6 +664,14 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
                        fixed(breakdown.reflected, 1) + " W/m2");
       ImGui::Spacing();
       draw_heat_legend();
+      if (hovered_shell_irradiance) {
+        draw_label_value("Shell under cursor",
+                         fixed(*hovered_shell_irradiance, 1) + " W/m2");
+      } else if (shell_heat_busy) {
+        ImGui::TextDisabled("Shell values are calculating...");
+      } else {
+        ImGui::TextDisabled("Hover over the top shell for exact W/m2");
+      }
 
       ImGui::Spacing();
       ImGui::TextDisabled("VIEW");
@@ -679,6 +721,34 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
                                   static_cast<float>(std::max(1, framebuffer_height)),
           0.01f, 250.0f);
       const glm::mat4 vp = projection * view;
+
+      hovered_shell_irradiance.reset();
+      double cursor_x = 0.0, cursor_y = 0.0;
+      glfwGetCursorPos(window, &cursor_x, &cursor_y);
+      const double viewport_window_width =
+          static_cast<double>(window_width) - kPanelWidth;
+      if (!io.WantCaptureMouse && cursor_x >= kPanelWidth &&
+          cursor_x < window_width && cursor_y >= 0.0 &&
+          cursor_y < window_height && viewport_window_width > 1.0) {
+        const float ndc_x = static_cast<float>(
+            2.0 * (cursor_x - kPanelWidth) / viewport_window_width - 1.0);
+        const float ndc_y =
+            static_cast<float>(1.0 - 2.0 * cursor_y / window_height);
+        const glm::mat4 inverse_vp = glm::inverse(vp);
+        glm::vec4 near_point = inverse_vp * glm::vec4(ndc_x, ndc_y, -1.0f, 1.0f);
+        glm::vec4 far_point = inverse_vp * glm::vec4(ndc_x, ndc_y, 1.0f, 1.0f);
+        near_point /= near_point.w;
+        far_point /= far_point.w;
+        const glm::vec3 ray = glm::normalize(
+            glm::vec3(far_point) - glm::vec3(near_point));
+        const auto hit = scene.intersect(
+            {eye.x, eye.y, eye.z}, {ray.x, ray.y, ray.z},
+            settings.ray_epsilon_m, 1.0e30f, kCarMask);
+        if (hit && hit->primitive_id < shell_irradiance.size()) {
+          const float value = shell_irradiance[hit->primitive_id];
+          if (value >= 0.0f) hovered_shell_irradiance = value;
+        }
+      }
 
       glUseProgram(program);
       glUniformMatrix4fv(glGetUniformLocation(program, "uViewProjection"), 1,

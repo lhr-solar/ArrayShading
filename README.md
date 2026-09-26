@@ -139,7 +139,9 @@ The right viewport renders the complete STL plus heat-colored cells. Left-drag o
 mouse wheel zooms in small bounded increments, and Escape closes the application. The panel
 occupies its own screen area, so it does not cover the car. The shell heat map evaluates the
 top-envelope triangle centers with exact Embree sun-visibility rays plus an isotropic diffuse
-sky estimate; gray geometry is outside that top envelope.
+sky estimate; gray geometry is outside that top envelope. This full-shell calculation runs in
+the background so the window opens immediately. Hovering over a heat-mapped shell triangle
+shows its exact modeled irradiance in W/m² beneath the legend.
 
 ## Current optical model
 

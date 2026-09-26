@@ -126,6 +126,7 @@ std::optional<Hit> TraceScene::intersect(const Vec3& origin,
              origin + direction * ray_hit.ray.tfar,
              normal,
              ray_hit.hit.geomID,
+             ray_hit.hit.primID,
              material};
 }
 

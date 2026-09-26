@@ -15,7 +15,8 @@
 - Native GLFW/OpenGL/Dear ImGui desktop application rendering the same full triangle buffer
   used by the solver.
 - Per-triangle top-envelope shell heat map with Embree direct-shadow tests, diffuse-sky
-  magnitude, GPU texture-buffer coloring, and bounded fine-grained camera zoom.
+  magnitude, asynchronous calculation, cursor readout, GPU texture-buffer coloring, and
+  bounded fine-grained camera zoom.
 - Interactive sun/DNI/DHI, ray-count, recursion-depth, rerun, export, camera, heat legend,
   contribution breakdown, and display controls.
 - CMake/vcpkg build, VS Code tasks, and deterministic C++ core tests.
