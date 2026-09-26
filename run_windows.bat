@@ -38,6 +38,11 @@ if errorlevel 1 (
   exit /b 5
 )
 
+set "VS_CMAKE_BIN=%VS_INSTALL%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
+set "VS_NINJA_BIN=%VS_INSTALL%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja"
+if exist "%VS_CMAKE_BIN%\cmake.exe" set "PATH=%VS_CMAKE_BIN%;%PATH%"
+if exist "%VS_NINJA_BIN%\ninja.exe" set "PATH=%VS_NINJA_BIN%;%PATH%"
+
 where cmake >nul 2>nul
 if errorlevel 1 (
   echo ERROR: CMake was not found. Add CMake tools for Windows in Visual Studio Installer.
