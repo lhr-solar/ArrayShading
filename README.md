@@ -32,6 +32,27 @@ resolution cannot alter the numerical answer.
 
 Dependencies are declared in `vcpkg.json`: Embree 4, GLFW, GLEW, GLM, and Dear ImGui.
 
+## Fastest Windows start
+
+Install the **Desktop development with C++** workload in Visual Studio Installer and Git for
+Windows. Then open the repository in VS Code and run this one command in its terminal:
+
+```powershell
+.\run_windows.bat
+```
+
+The launcher finds Visual Studio, initializes MSVC, installs/bootstrap vcpkg when necessary,
+builds the project, and opens the GUI using
+`%USERPROFILE%\Downloads\_24-000.stl`. A different STL can be supplied as the first argument:
+
+```powershell
+.\run_windows.bat "D:\path\to\car.stl"
+```
+
+The initial build downloads and compiles the dependencies, so it is much slower than later
+runs. The launcher prints a specific Visual Studio Installer instruction if a required build
+component is missing.
+
 ## One-time vcpkg setup
 
 Windows PowerShell:
