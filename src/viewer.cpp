@@ -77,7 +77,12 @@ void main() {
   if (uShellHeat) {
     float direct = uDni * max(0.0, dot(normal, normalize(uSunDirection)));
     float sky = uDhi * clamp((1.0 + normal.z) * 0.5, 0.0, 1.0);
-    fragColor = vec4(irradianceColor(direct + sky), 1.0);
+    // Preserve enough form shading to make the curved STL readable beneath
+    // the heat map. Irradiance still selects the hue; this factor only affects
+    // the OpenGL preview and never feeds the Embree calculation.
+    vec3 key = normalize(vec3(-0.35, -0.45, 0.82));
+    float form = 0.74 + 0.26 * max(0.0, dot(normal, key));
+    fragColor = vec4(irradianceColor(direct + sky) * form, 1.0);
     return;
   }
   float incidence = max(0.0, dot(normal, normalize(uSunDirection)));
@@ -511,6 +516,7 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
     bool show_shell = true;
     bool show_shell_heat = true;
     bool show_cells = true;
+    bool show_cell_heat = false;
     bool show_grid = true;
     bool show_sun = true;
     bool wireframe = false;
@@ -717,6 +723,7 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       ImGui::SameLine(180.0f);
       ImGui::Checkbox("Sun direction", &show_sun);
       if (show_cells) {
+        ImGui::Checkbox("Cell irradiance fill", &show_cell_heat);
         ImGui::TextColored({0.10f, 0.78f, 0.96f, 1.0f}, "2x3 outline");
         ImGui::SameLine(150.0f);
         ImGui::TextColored({1.00f, 0.55f, 0.12f, 1.0f}, "1x3 outline");
@@ -825,15 +832,17 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       }
 
       if (show_cells) {
-        glEnable(GL_POLYGON_OFFSET_FILL);
-        glPolygonOffset(-1.0f, -1.0f);
-        glUniform1i(glGetUniformLocation(program, "uUnlit"), GL_FALSE);
-        glUniform1i(glGetUniformLocation(program, "uCellPass"), GL_TRUE);
-        glUniform1i(glGetUniformLocation(program, "uShellHeat"), GL_FALSE);
-        glBindVertexArray(cells_vao);
-        glDrawArrays(GL_TRIANGLES, 0,
-                     static_cast<GLsizei>(rendered_cells.size()));
-        glDisable(GL_POLYGON_OFFSET_FILL);
+        if (show_cell_heat) {
+          glEnable(GL_POLYGON_OFFSET_FILL);
+          glPolygonOffset(-1.0f, -1.0f);
+          glUniform1i(glGetUniformLocation(program, "uUnlit"), GL_FALSE);
+          glUniform1i(glGetUniformLocation(program, "uCellPass"), GL_TRUE);
+          glUniform1i(glGetUniformLocation(program, "uShellHeat"), GL_FALSE);
+          glBindVertexArray(cells_vao);
+          glDrawArrays(GL_TRIANGLES, 0,
+                       static_cast<GLsizei>(rendered_cells.size()));
+          glDisable(GL_POLYGON_OFFSET_FILL);
+        }
         glUniform1i(glGetUniformLocation(program, "uUnlit"), GL_TRUE);
         glBindVertexArray(outlines_vao);
         glLineWidth(2.0f);

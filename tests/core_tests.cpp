@@ -207,6 +207,21 @@ int main() {
               generated.cells.front().module_columns == 2,
           "layout records module dimensions per cell");
 
+  // A 1x3/2x3 group describes an arrangement of individually supported cells,
+  // not a rigid planar plate. Curved-shell normals must not cause the layout
+  // stage to reject locations that already passed footprint validation.
+  for (solar::Cell& cell : layout_candidates) {
+    cell.normal = cell.column == 0U
+                      ? solar::normalized(Vec3{-0.5f, 0.0f, 0.8660254f})
+                      : solar::normalized(Vec3{0.5f, 0.0f, 0.8660254f});
+  }
+  const solar::GeneratedLayout curved_generated =
+      solar::generate_vertical_module_layout(layout_candidates, layout_grid);
+  require(curved_generated.summary.two_by_three_modules == 1 &&
+              curved_generated.summary.one_by_three_modules == 1 &&
+              curved_generated.cells.size() == 9,
+          "curved-shell cell groups are not treated as rigid flat plates");
+
   if (failures != 0) {
     std::cerr << failures << " test assertion(s) failed\n";
     return 1;

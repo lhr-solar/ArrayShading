@@ -322,17 +322,16 @@ GeneratedLayout generate_vertical_module_layout(
   auto at = [&](std::uint32_t row, std::uint32_t column) -> const Cell* {
     return slots[static_cast<std::size_t>(row) * grid.columns + column];
   };
-  auto coherent = [&](std::uint32_t row, std::uint32_t column,
-                      std::uint32_t columns) {
-    const Cell* reference = at(row, column);
-    if (!reference) return false;
-    constexpr float kMinimumNormalDot = 0.85f;
+  // Footprint support and local surface continuity were already validated for
+  // each candidate. The 1x3/2x3 grouping is an arrangement of conforming
+  // cells, not a second rigid plate that must share one normal.
+  auto available = [&](std::uint32_t row, std::uint32_t column,
+                       std::uint32_t columns) {
     for (std::uint32_t row_offset = 0; row_offset < 3U; ++row_offset) {
       for (std::uint32_t column_offset = 0; column_offset < columns;
            ++column_offset) {
         const Cell* cell = at(row + row_offset, column + column_offset);
-        if (!cell || dot(reference->normal, cell->normal) < kMinimumNormalDot)
-          return false;
+        if (!cell) return false;
       }
     }
     return true;
@@ -366,10 +365,10 @@ GeneratedLayout generate_vertical_module_layout(
     for (std::uint32_t row = phase; row + 2U < grid.rows; row += 3U) {
       std::uint32_t column = 0;
       while (column < grid.columns) {
-        if (column + 1U < grid.columns && coherent(row, column, 2U)) {
+        if (column + 1U < grid.columns && available(row, column, 2U)) {
           append_module(row, column, 2U);
           column += 2U;
-        } else if (coherent(row, column, 1U)) {
+        } else if (available(row, column, 1U)) {
           append_module(row, column, 1U);
           ++column;
         } else {

@@ -148,9 +148,10 @@ The projected locations are grouped into vertical modules before simulation. A m
 contains three consecutive longitudinal cells. At each feasible row band, adjacent columns
 are taken as a 2x3 module first; any supported column left over becomes a 1x3 module. The
 generator evaluates all three possible longitudinal row phases and selects the one with the
-most 2x3 modules, breaking ties with the number of 1x3 modules. A module also requires its
-constituent cell normals to remain mutually coherent. This is a deterministic prioritized
-layout for the current regular grid, not yet the final route-energy set-packing optimizer.
+most 2x3 modules, breaking ties with the number of 1x3 modules. Each cell retains its own
+validated local shell tangent; a 1x3/2x3 group is not treated as one rigid planar plate, so
+valid groups may follow the curved nose. This is a deterministic prioritized layout for the
+current regular grid, not yet the final route-energy set-packing optimizer.
 
 ## Native GUI
 
@@ -168,9 +169,11 @@ simulation. Its left control panel provides:
 - shell, cells, ground-grid, sun-vector, and wireframe toggles;
 - CSV export and camera reset.
 
-The right viewport renders the complete STL plus the generated, heat-colored cell layout by
-default. Cyan outlines identify cells in 2x3 modules and orange outlines identify cells in
-1x3 modules. Left-drag orbits, the
+The right viewport renders the complete STL plus the generated cell layout. The shell heat
+map retains subtle form shading so its curvature remains visible. Cyan outlines identify
+cells in 2x3 modules and orange outlines identify cells in 1x3 modules. Cell irradiance fill
+is optional and off by default so the layout cannot look like a detached opaque sheet.
+Left-drag orbits, the
 mouse wheel zooms in small bounded increments, and Escape closes the application. The panel
 occupies its own screen area, so it does not cover the car. The shell heat map evaluates the
 local triangle orientation using DNI plus an isotropic diffuse-sky estimate and responds
