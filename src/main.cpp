@@ -93,14 +93,16 @@ void usage(const char* executable) {
       << "  --rows N                   Candidate rows (default 44)\n"
       << "  --columns N                Candidate columns (default 12)\n"
       << "  --cell-gap M               Footprint gap (default 0.003)\n"
-      << "  --normal-radius M          Shell-normal sample distance (default 0.18)\n\n"
+      << "  --max-cell-plane-error M   Maximum tangent-plane error below a cell "
+         "(default 0.006)\n"
+      << "\n"
       << "Eligible upper-shell placement mask (world metres):\n"
       << "  --shell-x-min/max M        Lateral bounds (default -0.68 / 0.68)\n"
       << "  --shell-y-min/max M        Longitudinal bounds (default -2.90 / 2.80)\n"
       << "  --shell-z-min/max M        Height bounds (default 0.12 / 1.00)\n"
       << "  --canopy-x-min/max M       Canopy exclusion (default -0.32 / 0.32)\n"
       << "  --canopy-y-min/max M       Canopy exclusion (default -1.45 / 1.35)\n"
-      << "  --shell-normal-z N         Minimum absolute upwardness (default 0.35)\n\n"
+      << "  --shell-normal-z N         Minimum local upwardness (default 0.75)\n\n"
       << "Output:\n"
       << "  --output PATH              Per-cell CSV path\n"
       << "  --headless                 Skip the OpenGL result window\n"
@@ -167,8 +169,10 @@ Options parse_options(int argc, char** argv) {
       options.grid.columns = positive_integer(next(index, flag), flag);
     } else if (flag == "--cell-gap") {
       options.grid.gap_m = number(next(index, flag), flag);
-    } else if (flag == "--normal-radius") {
-      options.grid.normal_sample_distance_m = number(next(index, flag), flag);
+    } else if (flag == "--max-cell-plane-error" ||
+               flag == "--max-cell-height-delta") {
+      options.grid.maximum_support_plane_deviation_m =
+          number(next(index, flag), flag);
     } else if (flag == "--shell-x-min") {
       options.shell_region.minimum.x = number(next(index, flag), flag);
     } else if (flag == "--shell-x-max") {
@@ -203,8 +207,10 @@ Options parse_options(int argc, char** argv) {
   if (options.stl_path.empty()) throw std::runtime_error("--stl PATH is required");
   if (options.transform.scale <= 0.0f || options.sun.dni_w_m2 < 0.0f ||
       options.sun.dhi_w_m2 < 0.0f || options.grid.gap_m < 0.0f ||
-      options.grid.normal_sample_distance_m <= 0.0f) {
-    throw std::runtime_error("Scale/radius must be positive; irradiance/gap cannot be negative");
+      options.grid.maximum_support_plane_deviation_m < 0.0f) {
+    throw std::runtime_error(
+        "Scale must be positive; irradiance/gap/plane error cannot "
+        "be negative");
   }
   if (elevation < -90.0f || elevation > 90.0f)
     throw std::runtime_error("Elevation must be between -90 and 90 degrees");

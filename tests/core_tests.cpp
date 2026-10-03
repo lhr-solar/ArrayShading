@@ -106,6 +106,76 @@ int main() {
   require(close(test_cells[0].direct_w_m2, 0.0f),
           "direct irradiance reset between runs");
 
+  // Placement accepts a fully supported horizontal footprint and its local
+  // tangent orientation is world-up.
+  solar::TriangleMesh flat_shell;
+  for (const Vec3 vertex : {
+           Vec3{-1.0f, -1.0f, 0.5f}, Vec3{1.0f, -1.0f, 0.5f},
+           Vec3{1.0f, 1.0f, 0.5f}, Vec3{-1.0f, -1.0f, 0.5f},
+           Vec3{1.0f, 1.0f, 0.5f}, Vec3{-1.0f, 1.0f, 0.5f}}) {
+    flat_shell.vertices.push_back(vertex);
+    flat_shell.bounds.include(vertex);
+  }
+  solar::TraceScene flat_scene(flat_shell);
+  solar::CellGrid placement_grid;
+  placement_grid.rows = 1;
+  placement_grid.columns = 1;
+  const std::vector<solar::Cell> flat_cells =
+      solar::project_cells(flat_scene, flat_shell.bounds, placement_grid);
+  require(flat_cells.size() == 1, "flat shell accepts one supported cell");
+  require(!flat_cells.empty() && close(flat_cells[0].normal.x, 0.0f) &&
+              close(flat_cells[0].normal.y, 0.0f) &&
+              close(flat_cells[0].normal.z, 1.0f),
+          "flat-shell cell is world-up");
+  require(!flat_cells.empty() && close(flat_cells[0].center.z, 0.501f),
+          "projected cell uses one millimetre vertical clearance");
+
+  // A planar slope may rise substantially in world Z while remaining a valid
+  // tangent surface. The cell should follow that plane rather than being
+  // forced horizontal or rejected by raw height difference.
+  solar::TriangleMesh sloped_shell;
+  for (const Vec3 vertex : {
+           Vec3{-1.0f, -1.0f, 0.3f}, Vec3{1.0f, -1.0f, 0.7f},
+           Vec3{1.0f, 1.0f, 0.7f}, Vec3{-1.0f, -1.0f, 0.3f},
+           Vec3{1.0f, 1.0f, 0.7f}, Vec3{-1.0f, 1.0f, 0.3f}}) {
+    sloped_shell.vertices.push_back(vertex);
+    sloped_shell.bounds.include(vertex);
+  }
+  solar::TraceScene sloped_scene(sloped_shell);
+  const std::vector<solar::Cell> sloped_cells =
+      solar::project_cells(sloped_scene, sloped_shell.bounds, placement_grid);
+  require(sloped_cells.size() == 1,
+          "planar sloped shell accepts tangent cell");
+  require(!sloped_cells.empty() && sloped_cells[0].normal.x < -0.19f &&
+              sloped_cells[0].normal.z > 0.98f,
+          "cell follows sloped shell normal");
+
+  // A smaller, height-disconnected upward-facing patch represents a wheel or
+  // hub under an opening. Only the largest smooth grid component is retained.
+  solar::TriangleMesh shell_with_hub;
+  auto append_quad = [&](float x_min, float x_max, float z) {
+    for (const Vec3 vertex : {
+             Vec3{x_min, -1.0f, z}, Vec3{x_max, -1.0f, z},
+             Vec3{x_max, 1.0f, z}, Vec3{x_min, -1.0f, z},
+             Vec3{x_max, 1.0f, z}, Vec3{x_min, 1.0f, z}}) {
+      shell_with_hub.vertices.push_back(vertex);
+      shell_with_hub.bounds.include(vertex);
+    }
+  };
+  append_quad(-0.25f, 0.063f, 0.5f);
+  append_quad(0.065f, 0.20f, 0.2f);
+  solar::TraceScene disconnected_scene(shell_with_hub);
+  solar::CellGrid disconnected_grid;
+  disconnected_grid.rows = 1;
+  disconnected_grid.columns = 3;
+  const std::vector<solar::Cell> connected_cells = solar::project_cells(
+      disconnected_scene, shell_with_hub.bounds, disconnected_grid);
+  require(connected_cells.size() == 2,
+          "smaller disconnected hub component is removed");
+  require(connected_cells.size() == 2 && connected_cells[0].column != 2 &&
+              connected_cells[1].column != 2,
+          "retained candidates belong to primary shell component");
+
   // A complete 3x3 candidate patch should prefer one adjacent 2x3 module,
   // then use one 1x3 module for the remaining column.
   solar::CellGrid layout_grid;

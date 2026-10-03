@@ -16,9 +16,9 @@ to catch sign, normalization, occlusion, and unit errors.
 
 ## Provisional 2x3 / 1x3 layout selection
 
-Let `C(r,c)` mean that the projected cell location at longitudinal row `r` and lateral
-column `c` exists and lies on the eligible upper shell. A 1x3 module beginning at `(r,c)` is
-feasible when all three locations exist and their surface normals remain coherent:
+Let `C(r,c)` mean that the projected tangent cell location at longitudinal row `r` and
+lateral column `c` has complete, locally planar upper-shell support. A 1x3 module beginning
+at `(r,c)` is feasible when all three locations exist and remain normally coherent:
 
 ```text
 C(r+i,c) = true                           for i in {0,1,2}
@@ -116,18 +116,28 @@ and multi-bounce scene radiance, multiplied by `ρ k_s` at each bounce and bound
 ## Cell projection, spatial aggregation, and incident power
 
 Candidate cell centers form a 125 mm plus gap grid in world `(x,y)`. Placement triangles are
-first filtered by a configurable XYZ inclusion box, a central canopy exclusion prism, and a
-minimum absolute normal-Z component. A vertical ray finds the topmost eligible intersection;
-the unfiltered STL is still used by all later visibility rays. Nearby eligible intersections
-in `±x` and `±y` estimate tangents, and the local cell normal is:
+first filtered by a configurable XYZ inclusion box and central canopy exclusion prism; they
+are not deleted merely for being curved. A vertical center ray plus neighboring height
+samples estimate the local tangent:
 
 ```text
-t_x = p(x+δ,y) - p(x-δ,y)
-t_y = p(x,y+δ) - p(x,y-δ)
-n = normalize(t_x × t_y), with n_z > 0
+t_x = p(x+delta,y) - p(x-delta,y)
+t_y = p(x,y+delta) - p(x,y-delta)
+n = normalize(t_x cross t_y), with n_z > 0
 ```
 
-Cells without a top-shell hit or below the configured minimum `n_z` are omitted. Direct-beam
+Nine vertical rays then sample the center, edges, and corners of the footprint. Every sample
+must hit the eligible shell, have a coherent normal, and remain close to the tangent plane:
+
+```text
+abs((p_support - p_center) dot n) <= 0.006 m
+```
+
+Grid-neighbor candidates are connected only across smooth normal and height changes, and only
+the largest connected region is retained as the primary outer shell. This preserves the
+curved shell while removing isolated wheel-hub candidates. The accepted cell uses the local
+tangent axes and a 1 mm normal clearance. The unfiltered STL is still used by all later
+visibility rays. Direct-beam
 visibility is averaged across the cell footprint; diffuse-sky and reflected irradiance are
 currently evaluated at the cell center. With published Maxeon Gen III active area
 `A_active = 0.0153 m²`:

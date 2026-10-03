@@ -102,12 +102,6 @@ TriangleMesh filter_eligible_shell(const TriangleMesh& source,
     if (inside(centroid, region.exclusion_minimum,
                region.exclusion_maximum))
       continue;
-    const Vec3 geometric_normal = cross(b - a, c - a);
-    const float magnitude = length(geometric_normal);
-    if (magnitude <= 1.0e-12f ||
-        std::abs(geometric_normal.z) / magnitude <
-            region.minimum_upward_normal_z)
-      continue;
     result.vertices.push_back(a);
     result.vertices.push_back(b);
     result.vertices.push_back(c);

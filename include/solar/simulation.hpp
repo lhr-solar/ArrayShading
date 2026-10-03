@@ -30,8 +30,8 @@ struct CellGrid {
   float height_m = 0.125f;
   float active_area_m2 = 0.0153f;
   float gap_m = 0.003f;
-  float surface_offset_m = 0.004f;
-  float normal_sample_distance_m = 0.18f;
+  float surface_offset_m = 0.001f;
+  float maximum_support_plane_deviation_m = 0.006f;
   float minimum_upward_normal_z = 0.35f;
   float center_x_m = 0.0f;
   float center_y_m = 0.0f;

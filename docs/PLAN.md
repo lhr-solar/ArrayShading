@@ -26,8 +26,8 @@ perform ray-count convergence and canonical-scene comparisons.
 
 - Generalize the implemented regular-grid module generator into a complete feasible-candidate
   enumeration over eligible shell regions.
-- Enforce full footprint support, edge clearance, tile spacing, curvature, normal variation,
-  canopy exclusion, and mechanical keep-outs.
+- Extend the implemented footprint-support and canopy checks with formal edge clearance,
+  tile spacing, mechanical keep-outs, and assembly constraints.
 - Precompute route-weighted irradiance value for every feasible candidate.
 - Solve a binary weighted set-packing problem with non-overlap constraints.
 - Optimize lexicographically: route energy, cell count, preference for 2x3 groups, then lower

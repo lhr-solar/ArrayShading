@@ -23,7 +23,7 @@ struct ShellRegion {
   Vec3 maximum{0.68f, 2.80f, 1.00f};
   Vec3 exclusion_minimum{-0.32f, -1.45f, 0.00f};
   Vec3 exclusion_maximum{0.32f, 1.35f, 1.40f};
-  float minimum_upward_normal_z = 0.35f;
+  float minimum_upward_normal_z = 0.75f;
 };
 
 TriangleMesh load_binary_stl(const std::filesystem::path& path,

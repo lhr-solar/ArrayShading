@@ -131,20 +131,26 @@ Use `--help` to see all transform, sun, integration, cell-grid, thread, and outp
 Use `--headless` for CSV-only execution on a compute node.
 
 Candidate placement uses a configurable world-space upper-shell mask. The default inclusion
-box is `x=[-0.68,0.68]`, `y=[-2.90,2.80]`, `z=[0.12,1.00]` metres, requires an upward-normal
-component of at least `0.35`, and removes a central canopy prism
+box is `x=[-0.68,0.68]`, `y=[-2.90,2.80]`, `z=[0.12,1.00]` metres, requires a local
+upward-normal component of at least `0.75`, and removes a central canopy prism
 `x=[-0.32,0.32], y=[-1.45,1.35]`. CLI `--shell-*`, `--canopy-*`, and
 `--shell-normal-z` options tune these provisional cutoffs. The filtered mesh is used only to
 place candidate cells; the complete STL remains in Embree and continues to cast shadows.
+Every candidate then requires a complete 3x3 support sample across its 125 mm footprint.
+Those points must remain within 6 mm of the locally fitted tangent plane and have consistent
+normals. This accepts smooth top-shell curvature while rejecting openings, sharp hub/body
+geometry, and quads that would bridge unrelated surfaces. The largest smooth connected
+candidate region is retained as the primary shell, removing disconnected islands such as
+wheel hubs. Accepted cells follow the local shell tangent with 1 mm clearance. The planarity
+tolerance is adjustable with `--max-cell-plane-error`.
 
 The projected locations are grouped into vertical modules before simulation. A module always
 contains three consecutive longitudinal cells. At each feasible row band, adjacent columns
 are taken as a 2x3 module first; any supported column left over becomes a 1x3 module. The
 generator evaluates all three possible longitudinal row phases and selects the one with the
-most 2x3 modules, breaking ties with the number of 1x3 modules. A normal-coherence check
-rejects a module if any constituent cell differs from its reference surface normal by more
-than about 31.8 degrees (`dot < 0.85`). This is a deterministic prioritized layout for the
-current regular grid, not yet the final route-energy set-packing optimizer.
+most 2x3 modules, breaking ties with the number of 1x3 modules. A module also requires its
+constituent cell normals to remain mutually coherent. This is a deterministic prioritized
+layout for the current regular grid, not yet the final route-energy set-packing optimizer.
 
 ## Native GUI
 

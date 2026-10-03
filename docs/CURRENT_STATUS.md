@@ -8,8 +8,10 @@
 - Full `_24-000.stl` support: 14,236,786 triangles and 711,839,384 bytes validated.
 - Embree 4 high-quality BVH with exact full-mesh shadow and reflection queries.
 - Automatic Maxeon Gen III candidate grid projected onto a configurable axis-aligned
-  upper-shell region with a central canopy exclusion, upward-normal rejection, and locally
-  smoothed normals. The full mesh remains active for optical occlusion.
+  upper-shell region with a central canopy exclusion and local upward-normal rejection. Each
+  accepted tangent cell requires nine footprint support hits within 6 mm of its fitted plane;
+  only the largest smooth connected candidate surface is retained. The full mesh remains
+  active for optical occlusion.
 - Deterministic vertical-module layout generation: test all three longitudinal row phases,
   maximize feasible adjacent 2x3 groups first, then fill remaining supported columns with
   1x3 groups. Per-cell module IDs and dimensions are exported to CSV.
@@ -33,8 +35,8 @@
 
 The current result is optical irradiance and incident optical watts. The axis-cutoff and
 phase-aligned module generator produce a useful provisional layout, not a globally optimal
-route-energy solution or assembly-derived cell layout. Shell and ground optical properties
-are still
+route-energy solution or assembly-derived cell layout. Cells follow the locally estimated
+top-shell tangent. Shell and ground optical properties are still
 provisional scalar Lambert/Phong parameters. Live shell coloring is an orientation preview;
 validated occlusion and recursive reflection values are the Embree selected-cell results.
 

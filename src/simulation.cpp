@@ -1,5 +1,6 @@
 #include "solar/simulation.hpp"
 
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <fstream>
@@ -18,26 +19,6 @@ std::optional<Hit> top_hit(const TraceScene& scene, float x, float y,
                          1.0e30f, kCarMask);
 }
 
-Vec3 estimated_normal(const TraceScene& scene, float x, float y, float start_z,
-                      float delta, const Hit& center) {
-  const auto left = top_hit(scene, x - delta, y, start_z);
-  const auto right = top_hit(scene, x + delta, y, start_z);
-  const auto back = top_hit(scene, x, y - delta, start_z);
-  const auto front = top_hit(scene, x, y + delta, start_z);
-  const Vec3 tx = left && right ? right->point - left->point
-                  : right      ? right->point - center.point
-                  : left       ? center.point - left->point
-                               : Vec3{1.0f, 0.0f, 0.0f};
-  const Vec3 ty = back && front ? front->point - back->point
-                  : front       ? front->point - center.point
-                  : back        ? center.point - back->point
-                                : Vec3{0.0f, 1.0f, 0.0f};
-  Vec3 normal = cross(tx, ty);
-  if (length(normal) < 1.0e-8f) normal = center.normal;
-  normal = normalized(normal);
-  return normal.z < 0.0f ? -normal : normal;
-}
-
 std::pair<Vec3, Vec3> tangent_axes(const Vec3& normal) {
   Vec3 preferred{1.0f, 0.0f, 0.0f};
   Vec3 u = preferred - normal * dot(preferred, normal);
@@ -47,6 +28,64 @@ std::pair<Vec3, Vec3> tangent_axes(const Vec3& normal) {
   }
   u = normalized(u);
   return {u, normalized(cross(normal, u))};
+}
+
+std::vector<Cell> primary_surface_component(std::vector<Cell> cells,
+                                            const CellGrid& grid) {
+  if (cells.size() < 2U) return cells;
+  std::vector<int> slots(static_cast<std::size_t>(grid.rows) * grid.columns,
+                         -1);
+  for (std::size_t index = 0; index < cells.size(); ++index) {
+    const Cell& cell = cells[index];
+    slots[static_cast<std::size_t>(cell.row) * grid.columns + cell.column] =
+        static_cast<int>(index);
+  }
+
+  std::vector<bool> visited(cells.size(), false);
+  std::vector<std::size_t> largest;
+  constexpr int kNeighborOffsets[4][2] = {
+      {-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+  constexpr float kMaximumNeighborHeightStepM = 0.10f;
+  constexpr float kMinimumNeighborNormalDot = 0.75f;
+  for (std::size_t seed = 0; seed < cells.size(); ++seed) {
+    if (visited[seed]) continue;
+    std::vector<std::size_t> component;
+    std::vector<std::size_t> frontier{seed};
+    visited[seed] = true;
+    while (!frontier.empty()) {
+      const std::size_t current_index = frontier.back();
+      frontier.pop_back();
+      component.push_back(current_index);
+      const Cell& current = cells[current_index];
+      for (const auto& offset : kNeighborOffsets) {
+        const int row = static_cast<int>(current.row) + offset[0];
+        const int column = static_cast<int>(current.column) + offset[1];
+        if (row < 0 || column < 0 || row >= static_cast<int>(grid.rows) ||
+            column >= static_cast<int>(grid.columns))
+          continue;
+        const int neighbor_slot =
+            slots[static_cast<std::size_t>(row) * grid.columns +
+                  static_cast<std::uint32_t>(column)];
+        if (neighbor_slot < 0) continue;
+        const std::size_t neighbor_index =
+            static_cast<std::size_t>(neighbor_slot);
+        if (visited[neighbor_index]) continue;
+        const Cell& neighbor = cells[neighbor_index];
+        if (std::abs(current.center.z - neighbor.center.z) >
+                kMaximumNeighborHeightStepM ||
+            dot(current.normal, neighbor.normal) < kMinimumNeighborNormalDot)
+          continue;
+        visited[neighbor_index] = true;
+        frontier.push_back(neighbor_index);
+      }
+    }
+    if (component.size() > largest.size()) largest = std::move(component);
+  }
+
+  std::vector<Cell> result;
+  result.reserve(largest.size());
+  for (const std::size_t index : largest) result.push_back(cells[index]);
+  return result;
 }
 
 class Integrator {
@@ -200,14 +239,60 @@ std::vector<Cell> project_cells(const TraceScene& scene, const Bounds& bounds,
            inside(hit->point, eligible_region->exclusion_minimum,
                   eligible_region->exclusion_maximum)))
         continue;
-      const Vec3 normal = estimated_normal(scene, x, y, start_z,
-                                           grid.normal_sample_distance_m, *hit);
       const float minimum_normal =
           eligible_region
               ? std::max(grid.minimum_upward_normal_z,
                          eligible_region->minimum_upward_normal_z)
               : grid.minimum_upward_normal_z;
+
+      // Fit a planar cell to the local shell tangent. All nine footprint
+      // samples must remain close to that plane, which accepts a smooth curved
+      // shell but rejects gaps, sharp wheel geometry, and unrelated surfaces.
+      bool fully_supported = true;
+      std::array<Hit, 9> supports{};
+      for (int v_index = -1; v_index <= 1 && fully_supported; ++v_index) {
+        for (int u_index = -1; u_index <= 1; ++u_index) {
+          const float sample_x =
+              x + static_cast<float>(u_index) * 0.5f * grid.width_m;
+          const float sample_y =
+              y + static_cast<float>(v_index) * 0.5f * grid.height_m;
+          const auto support = u_index == 0 && v_index == 0
+                                   ? hit
+                                   : top_hit(scene, sample_x, sample_y, start_z);
+          if (!support ||
+              (eligible_region &&
+               (!inside(support->point, eligible_region->minimum,
+                        eligible_region->maximum) ||
+                inside(support->point, eligible_region->exclusion_minimum,
+                       eligible_region->exclusion_maximum)))) {
+            fully_supported = false;
+            break;
+          }
+          const std::size_t support_index =
+              static_cast<std::size_t>((v_index + 1) * 3 + (u_index + 1));
+          supports[support_index] = *support;
+        }
+      }
+      if (!fully_supported) continue;
+
+      Vec3 normal = cross(supports[5].point - supports[3].point,
+                          supports[7].point - supports[1].point);
+      if (length(normal) < 1.0e-8f) continue;
+      normal = normalized(normal);
+      if (normal.z < 0.0f) normal = -normal;
       if (normal.z < minimum_normal) continue;
+      for (const Hit& support : supports) {
+        const float plane_deviation =
+            std::abs(dot(support.point - hit->point, normal));
+        if (support.normal.z < minimum_normal ||
+            plane_deviation > grid.maximum_support_plane_deviation_m ||
+            dot(support.normal, normal) < 0.75f) {
+          fully_supported = false;
+          break;
+        }
+      }
+      if (!fully_supported) continue;
+
       const auto [u, v] = tangent_axes(normal);
       cells.push_back({row,
                        column,
@@ -220,7 +305,7 @@ std::vector<Cell> project_cells(const TraceScene& scene, const Bounds& bounds,
                        grid.active_area_m2});
     }
   }
-  return cells;
+  return primary_surface_component(std::move(cells), grid);
 }
 
 GeneratedLayout generate_vertical_module_layout(
