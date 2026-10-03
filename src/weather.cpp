@@ -1,5 +1,9 @@
 #include "solar/weather.hpp"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
 
@@ -205,10 +209,11 @@ WeatherConditions fetch_open_meteo_current(double latitude, double longitude) {
   WeatherConditions result;
   result.latitude = latitude;
   result.longitude = longitude;
-  result.dni_w_m2 = std::max(0.0f, required_number(
-                                       current, "direct_normal_irradiance"));
+  result.dni_w_m2 =
+      (std::max)(0.0f,
+                 required_number(current, "direct_normal_irradiance"));
   result.dhi_w_m2 =
-      std::max(0.0f, required_number(current, "diffuse_radiation"));
+      (std::max)(0.0f, required_number(current, "diffuse_radiation"));
   result.air_temperature_c = required_number(current, "temperature_2m");
   result.cloud_cover_percent =
       std::clamp(required_number(current, "cloud_cover"), 0.0f, 100.0f);
