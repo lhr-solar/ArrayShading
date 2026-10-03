@@ -2,6 +2,7 @@
   "name": "solar-whitted-cpp",
   "version-string": "0.1.0",
   "dependencies": [
+    "cpr",
     "embree",
     "glew",
     "glfw3",
@@ -12,6 +13,7 @@
         "glfw-binding",
         "opengl3-binding"
       ]
-    }
+    },
+    "nlohmann-json"
   ]
 }

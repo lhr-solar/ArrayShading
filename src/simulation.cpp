@@ -7,6 +7,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 namespace solar {
 namespace {
@@ -55,12 +56,39 @@ class Integrator {
       : scene_(scene), sun_(sun), settings_(settings) {}
 
   void evaluate(Cell& cell) const {
-    const Vec3 origin = cell.center + cell.normal * settings_.ray_epsilon_m;
+    cell.direct_visibility_fraction = 0.0f;
+    cell.direct_w_m2 = 0.0f;
+    cell.diffuse_sky_w_m2 = 0.0f;
+    cell.scene_reflected_w_m2 = 0.0f;
+
+    const Vec3 center_origin =
+        cell.center + cell.normal * settings_.ray_epsilon_m;
     const float cosine = std::max(0.0f, dot(cell.normal, sun_.direction_to_sun));
-    if (cosine > 0.0f &&
-        scene_.visible(origin, sun_.direction_to_sun,
-                       settings_.ray_epsilon_m)) {
-      cell.direct_w_m2 = sun_.dni_w_m2 * cosine;
+    if (cosine > 0.0f) {
+      const std::uint32_t axis_samples =
+          std::clamp(settings_.direct_samples_per_axis, 1U, 64U);
+      std::uint32_t visible_samples = 0;
+      for (std::uint32_t v_index = 0; v_index < axis_samples; ++v_index) {
+        const float v_fraction =
+            (static_cast<float>(v_index) + 0.5f) / axis_samples - 0.5f;
+        for (std::uint32_t u_index = 0; u_index < axis_samples; ++u_index) {
+          const float u_fraction =
+              (static_cast<float>(u_index) + 0.5f) / axis_samples - 0.5f;
+          const Vec3 sample =
+              cell.center + cell.u_axis * (u_fraction * cell.width_m) +
+              cell.v_axis * (v_fraction * cell.height_m);
+          if (scene_.visible(sample + cell.normal * settings_.ray_epsilon_m,
+                             sun_.direction_to_sun,
+                             settings_.ray_epsilon_m)) {
+            ++visible_samples;
+          }
+        }
+      }
+      const std::uint32_t sample_count = axis_samples * axis_samples;
+      cell.direct_visibility_fraction =
+          static_cast<float>(visible_samples) / sample_count;
+      cell.direct_w_m2 =
+          sun_.dni_w_m2 * cosine * cell.direct_visibility_fraction;
     }
 
     float sky_sum = 0.0f;
@@ -68,7 +96,7 @@ class Integrator {
     for (std::uint32_t index = 0; index < settings_.hemisphere_samples; ++index) {
       const Vec3 direction = cosine_hemisphere(
           index, settings_.hemisphere_samples, cell.normal);
-      const auto hit = scene_.intersect(origin, direction,
+      const auto hit = scene_.intersect(center_origin, direction,
                                         settings_.ray_epsilon_m);
       if (!hit) {
         if (direction.z > 0.0f) sky_sum += sun_.dhi_w_m2 / kPi;
@@ -143,7 +171,14 @@ class Integrator {
 }  // namespace
 
 std::vector<Cell> project_cells(const TraceScene& scene, const Bounds& bounds,
-                                const CellGrid& grid) {
+                                const CellGrid& grid,
+                                const ShellRegion* eligible_region) {
+  auto inside = [](const Vec3& point, const Vec3& minimum,
+                   const Vec3& maximum) {
+    return point.x >= minimum.x && point.x <= maximum.x &&
+           point.y >= minimum.y && point.y <= maximum.y &&
+           point.z >= minimum.z && point.z <= maximum.z;
+  };
   const float start_z = bounds.maximum.z + 1.0f;
   const float pitch_x = grid.width_m + grid.gap_m;
   const float pitch_y = grid.height_m + grid.gap_m;
@@ -159,9 +194,20 @@ std::vector<Cell> project_cells(const TraceScene& scene, const Bounds& bounds,
                        0.5f * static_cast<float>(grid.columns - 1U)) * pitch_x;
       const auto hit = top_hit(scene, x, y, start_z);
       if (!hit) continue;
+      if (eligible_region &&
+          (!inside(hit->point, eligible_region->minimum,
+                   eligible_region->maximum) ||
+           inside(hit->point, eligible_region->exclusion_minimum,
+                  eligible_region->exclusion_maximum)))
+        continue;
       const Vec3 normal = estimated_normal(scene, x, y, start_z,
                                            grid.normal_sample_distance_m, *hit);
-      if (normal.z < grid.minimum_upward_normal_z) continue;
+      const float minimum_normal =
+          eligible_region
+              ? std::max(grid.minimum_upward_normal_z,
+                         eligible_region->minimum_upward_normal_z)
+              : grid.minimum_upward_normal_z;
+      if (normal.z < minimum_normal) continue;
       const auto [u, v] = tangent_axes(normal);
       cells.push_back({row,
                        column,
@@ -175,6 +221,92 @@ std::vector<Cell> project_cells(const TraceScene& scene, const Bounds& bounds,
     }
   }
   return cells;
+}
+
+GeneratedLayout generate_vertical_module_layout(
+    const std::vector<Cell>& candidates, const CellGrid& grid) {
+  if (grid.rows < 3U || grid.columns == 0U) return {};
+  const std::size_t slot_count =
+      static_cast<std::size_t>(grid.rows) * grid.columns;
+  std::vector<const Cell*> slots(slot_count, nullptr);
+  for (const Cell& cell : candidates) {
+    if (cell.row < grid.rows && cell.column < grid.columns)
+      slots[static_cast<std::size_t>(cell.row) * grid.columns + cell.column] =
+          &cell;
+  }
+  auto at = [&](std::uint32_t row, std::uint32_t column) -> const Cell* {
+    return slots[static_cast<std::size_t>(row) * grid.columns + column];
+  };
+  auto coherent = [&](std::uint32_t row, std::uint32_t column,
+                      std::uint32_t columns) {
+    const Cell* reference = at(row, column);
+    if (!reference) return false;
+    constexpr float kMinimumNormalDot = 0.85f;
+    for (std::uint32_t row_offset = 0; row_offset < 3U; ++row_offset) {
+      for (std::uint32_t column_offset = 0; column_offset < columns;
+           ++column_offset) {
+        const Cell* cell = at(row + row_offset, column + column_offset);
+        if (!cell || dot(reference->normal, cell->normal) < kMinimumNormalDot)
+          return false;
+      }
+    }
+    return true;
+  };
+
+  GeneratedLayout best;
+  bool have_best = false;
+  for (std::uint32_t phase = 0; phase < 3U; ++phase) {
+    GeneratedLayout trial;
+    trial.summary.longitudinal_phase = phase;
+    std::uint32_t next_module_id = 1U;
+    auto append_module = [&](std::uint32_t row, std::uint32_t column,
+                             std::uint32_t columns) {
+      for (std::uint32_t row_offset = 0; row_offset < 3U; ++row_offset) {
+        for (std::uint32_t column_offset = 0; column_offset < columns;
+             ++column_offset) {
+          Cell selected = *at(row + row_offset, column + column_offset);
+          selected.module_id = next_module_id;
+          selected.module_rows = 3U;
+          selected.module_columns = columns;
+          trial.cells.push_back(selected);
+        }
+      }
+      if (columns == 2U)
+        ++trial.summary.two_by_three_modules;
+      else
+        ++trial.summary.one_by_three_modules;
+      ++next_module_id;
+    };
+
+    for (std::uint32_t row = phase; row + 2U < grid.rows; row += 3U) {
+      std::uint32_t column = 0;
+      while (column < grid.columns) {
+        if (column + 1U < grid.columns && coherent(row, column, 2U)) {
+          append_module(row, column, 2U);
+          column += 2U;
+        } else if (coherent(row, column, 1U)) {
+          append_module(row, column, 1U);
+          ++column;
+        } else {
+          ++column;
+        }
+      }
+    }
+    trial.summary.individual_cells = trial.cells.size();
+    const bool better =
+        !have_best ||
+        trial.summary.two_by_three_modules >
+            best.summary.two_by_three_modules ||
+        (trial.summary.two_by_three_modules ==
+             best.summary.two_by_three_modules &&
+         trial.summary.one_by_three_modules >
+             best.summary.one_by_three_modules);
+    if (better) {
+      best = std::move(trial);
+      have_best = true;
+    }
+  }
+  return best;
 }
 
 SimulationSummary simulate_cells(std::vector<Cell>& cells, const TraceScene& scene,
@@ -217,14 +349,19 @@ void write_cell_csv(const std::filesystem::path& path,
     std::filesystem::create_directories(path.parent_path());
   std::ofstream output(path);
   if (!output) throw std::runtime_error("Cannot write CSV: " + path.string());
-  output << "row,column,x_m,y_m,z_m,nx,ny,nz,direct_w_m2,diffuse_sky_w_m2,"
+  output << "module_id,module_rows,module_columns,row,column,x_m,y_m,z_m,"
+            "nx,ny,nz,direct_visibility_fraction,"
+            "direct_w_m2,diffuse_sky_w_m2,"
             "scene_reflected_w_m2,total_w_m2,active_area_m2,incident_w\n";
   output << std::setprecision(9);
   for (const Cell& cell : cells) {
-    output << cell.row << ',' << cell.column << ',' << cell.center.x << ','
+    output << cell.module_id << ',' << cell.module_rows << ','
+           << cell.module_columns << ',' << cell.row << ',' << cell.column << ','
+           << cell.center.x << ','
            << cell.center.y << ',' << cell.center.z << ',' << cell.normal.x
            << ',' << cell.normal.y << ',' << cell.normal.z << ','
-           << cell.direct_w_m2 << ',' << cell.diffuse_sky_w_m2 << ','
+           << cell.direct_visibility_fraction << ',' << cell.direct_w_m2 << ','
+           << cell.diffuse_sky_w_m2 << ','
            << cell.scene_reflected_w_m2 << ',' << cell.total_w_m2() << ','
            << cell.active_area_m2 << ','
            << cell.total_w_m2() * cell.active_area_m2 << '\n';

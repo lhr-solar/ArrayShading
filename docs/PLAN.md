@@ -5,6 +5,7 @@
 - Load and transform the complete binary STL.
 - Build an Embree triangle BVH.
 - Project candidate Maxeon cells onto the shell.
+- Generate a phase-aligned layout that prioritizes 2x3 modules and fills with 1x3 modules.
 - Calculate direct, diffuse-sky, and recursively reflected irradiance.
 - Export per-cell results and aggregate incident optical power.
 - Render the original triangle shell and irradiance heat map in a native OpenGL GUI.
@@ -15,14 +16,16 @@ perform ray-count convergence and canonical-scene comparisons.
 ## Phase 2 — CAD semantics and calibrated materials
 
 - Import the SolidWorks assembly hierarchy and component transformations.
-- Separate eligible solar shell, canopy, body, wheels, openings, and keep-out regions.
+- Replace the provisional XYZ/canopy placement mask with assembly-derived eligible shell,
+  canopy, body, wheels, openings, and mechanical keep-out regions.
 - Map component or triangle groups to named optical materials.
 - Replace provisional reflectance values with measured or sourced broadband BRDF inputs.
 - Import the installed cell layout when it exists.
 
 ## Phase 3 — 2x3 / 1x3 layout optimization
 
-- Generate feasible 2x3 and 1x3 Maxeon placement candidates over eligible shell regions.
+- Generalize the implemented regular-grid module generator into a complete feasible-candidate
+  enumeration over eligible shell regions.
 - Enforce full footprint support, edge clearance, tile spacing, curvature, normal variation,
   canopy exclusion, and mechanical keep-outs.
 - Precompute route-weighted irradiance value for every feasible candidate.

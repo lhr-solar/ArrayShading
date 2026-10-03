@@ -89,7 +89,7 @@ struct Bounds {
 };
 
 struct Transform {
-  float scale = 0.001f;
+  float scale = 1.0f;
   Vec3 rotation_degrees{90.0f, 0.0f, 0.0f};
   Vec3 translation{0.0f, -0.6563f, 0.0153f};
 

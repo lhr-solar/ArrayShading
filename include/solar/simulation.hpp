@@ -16,6 +16,7 @@ struct Sun {
 };
 
 struct SimulationSettings {
+  std::uint32_t direct_samples_per_axis = 3;
   std::uint32_t hemisphere_samples = 64;
   std::uint32_t max_reflection_depth = 2;
   float ray_epsilon_m = 1.0e-5f;
@@ -46,6 +47,10 @@ struct Cell {
   float width_m = 0.125f;
   float height_m = 0.125f;
   float active_area_m2 = 0.0153f;
+  std::uint32_t module_id = 0;
+  std::uint32_t module_rows = 0;
+  std::uint32_t module_columns = 0;
+  float direct_visibility_fraction = 0.0f;
   float direct_w_m2 = 0.0f;
   float diffuse_sky_w_m2 = 0.0f;
   float scene_reflected_w_m2 = 0.0f;
@@ -53,6 +58,18 @@ struct Cell {
   float total_w_m2() const {
     return direct_w_m2 + diffuse_sky_w_m2 + scene_reflected_w_m2;
   }
+};
+
+struct LayoutSummary {
+  std::size_t individual_cells = 0;
+  std::size_t one_by_three_modules = 0;
+  std::size_t two_by_three_modules = 0;
+  std::uint32_t longitudinal_phase = 0;
+};
+
+struct GeneratedLayout {
+  std::vector<Cell> cells;
+  LayoutSummary summary;
 };
 
 struct SimulationSummary {
@@ -63,7 +80,11 @@ struct SimulationSummary {
 };
 
 std::vector<Cell> project_cells(const TraceScene& scene, const Bounds& car_bounds,
-                                const CellGrid& grid);
+                                const CellGrid& grid,
+                                const ShellRegion* eligible_region = nullptr);
+
+GeneratedLayout generate_vertical_module_layout(
+    const std::vector<Cell>& candidates, const CellGrid& grid);
 
 SimulationSummary simulate_cells(std::vector<Cell>& cells, const TraceScene& scene,
                                  const Sun& sun,

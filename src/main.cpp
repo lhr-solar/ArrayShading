@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace {
 
@@ -21,6 +22,7 @@ struct Options {
   solar::Sun sun;
   solar::SimulationSettings simulation;
   solar::CellGrid grid;
+  solar::ShellRegion shell_region;
   std::size_t max_triangles = 0;
   bool headless = false;
 };
@@ -70,7 +72,7 @@ void usage(const char* executable) {
          "y=north, z=up.\n\n"
       << "Geometry:\n"
       << "  --stl PATH                 Binary car STL (required)\n"
-      << "  --scale N                  STL-unit to metre scale (default 0.001)\n"
+      << "  --scale N                  STL-unit to metre scale (default 1.0)\n"
       << "  --rotate-x DEG             X rotation (default 90)\n"
       << "  --rotate-y DEG             Y rotation (default 0)\n"
       << "  --rotate-z DEG             Z rotation (default 0)\n"
@@ -83,14 +85,22 @@ void usage(const char* executable) {
       << "  --elevation DEG            Above horizon (default 72.051)\n"
       << "  --dni W_M2                 Direct normal irradiance (default 850)\n"
       << "  --dhi W_M2                 Diffuse horizontal irradiance (default 110)\n"
+      << "  --direct-samples N         Direct-shadow samples per cell axis (default 3)\n"
       << "  --rays N                   Hemisphere rays per cell (default 64)\n"
       << "  --depth N                  Specular recursion depth (default 2)\n"
       << "  --threads N                Worker count (default hardware count)\n\n"
-      << "Cell preview grid:\n"
+      << "Cell layout grid:\n"
       << "  --rows N                   Candidate rows (default 44)\n"
       << "  --columns N                Candidate columns (default 12)\n"
       << "  --cell-gap M               Footprint gap (default 0.003)\n"
       << "  --normal-radius M          Shell-normal sample distance (default 0.18)\n\n"
+      << "Eligible upper-shell placement mask (world metres):\n"
+      << "  --shell-x-min/max M        Lateral bounds (default -0.68 / 0.68)\n"
+      << "  --shell-y-min/max M        Longitudinal bounds (default -2.90 / 2.80)\n"
+      << "  --shell-z-min/max M        Height bounds (default 0.12 / 1.00)\n"
+      << "  --canopy-x-min/max M       Canopy exclusion (default -0.32 / 0.32)\n"
+      << "  --canopy-y-min/max M       Canopy exclusion (default -1.45 / 1.35)\n"
+      << "  --shell-normal-z N         Minimum absolute upwardness (default 0.35)\n\n"
       << "Output:\n"
       << "  --output PATH              Per-cell CSV path\n"
       << "  --headless                 Skip the OpenGL result window\n"
@@ -140,6 +150,11 @@ Options parse_options(int argc, char** argv) {
     } else if (flag == "--rays") {
       options.simulation.hemisphere_samples =
           positive_integer(next(index, flag), flag);
+    } else if (flag == "--direct-samples") {
+      options.simulation.direct_samples_per_axis =
+          positive_integer(next(index, flag), flag);
+      if (options.simulation.direct_samples_per_axis > 64U)
+        throw std::runtime_error("--direct-samples must be between 1 and 64");
     } else if (flag == "--depth") {
       options.simulation.max_reflection_depth =
           nonnegative_integer(next(index, flag), flag);
@@ -154,6 +169,29 @@ Options parse_options(int argc, char** argv) {
       options.grid.gap_m = number(next(index, flag), flag);
     } else if (flag == "--normal-radius") {
       options.grid.normal_sample_distance_m = number(next(index, flag), flag);
+    } else if (flag == "--shell-x-min") {
+      options.shell_region.minimum.x = number(next(index, flag), flag);
+    } else if (flag == "--shell-x-max") {
+      options.shell_region.maximum.x = number(next(index, flag), flag);
+    } else if (flag == "--shell-y-min") {
+      options.shell_region.minimum.y = number(next(index, flag), flag);
+    } else if (flag == "--shell-y-max") {
+      options.shell_region.maximum.y = number(next(index, flag), flag);
+    } else if (flag == "--shell-z-min") {
+      options.shell_region.minimum.z = number(next(index, flag), flag);
+    } else if (flag == "--shell-z-max") {
+      options.shell_region.maximum.z = number(next(index, flag), flag);
+    } else if (flag == "--canopy-x-min") {
+      options.shell_region.exclusion_minimum.x = number(next(index, flag), flag);
+    } else if (flag == "--canopy-x-max") {
+      options.shell_region.exclusion_maximum.x = number(next(index, flag), flag);
+    } else if (flag == "--canopy-y-min") {
+      options.shell_region.exclusion_minimum.y = number(next(index, flag), flag);
+    } else if (flag == "--canopy-y-max") {
+      options.shell_region.exclusion_maximum.y = number(next(index, flag), flag);
+    } else if (flag == "--shell-normal-z") {
+      options.shell_region.minimum_upward_normal_z =
+          number(next(index, flag), flag);
     } else if (flag == "--max-triangles") {
       options.max_triangles = positive_integer(next(index, flag), flag);
     } else if (flag == "--headless") {
@@ -170,6 +208,17 @@ Options parse_options(int argc, char** argv) {
   }
   if (elevation < -90.0f || elevation > 90.0f)
     throw std::runtime_error("Elevation must be between -90 and 90 degrees");
+  if (options.shell_region.minimum.x > options.shell_region.maximum.x ||
+      options.shell_region.minimum.y > options.shell_region.maximum.y ||
+      options.shell_region.minimum.z > options.shell_region.maximum.z ||
+      options.shell_region.exclusion_minimum.x >
+          options.shell_region.exclusion_maximum.x ||
+      options.shell_region.exclusion_minimum.y >
+          options.shell_region.exclusion_maximum.y ||
+      options.shell_region.minimum_upward_normal_z < 0.0f ||
+      options.shell_region.minimum_upward_normal_z > 1.0f) {
+    throw std::runtime_error("Invalid eligible-shell cutoff configuration");
+  }
   options.sun.direction_to_sun =
       solar::sun_direction_from_azimuth_elevation(azimuth, elevation);
   return options;
@@ -204,10 +253,27 @@ int main(int argc, char** argv) {
     std::cout << "BVH built in " << elapsed_seconds(start) << " s\n";
 
     start = Clock::now();
-    std::vector<solar::Cell> cells =
-        solar::project_cells(scene, mesh.bounds, options.grid);
-    std::cout << "Projected " << cells.size()
-              << " Maxeon Gen III candidate cells\n";
+    std::vector<solar::Cell> candidates;
+    {
+      solar::TriangleMesh eligible_shell =
+          solar::filter_eligible_shell(mesh, options.shell_region);
+      std::cout << "Eligible placement shell: "
+                << eligible_shell.triangle_count() << " triangles\n";
+      solar::TraceScene placement_scene(eligible_shell);
+      candidates = solar::project_cells(placement_scene, eligible_shell.bounds,
+                                        options.grid, &options.shell_region);
+    }
+    std::cout << "Projected " << candidates.size()
+              << " valid Maxeon Gen III candidate locations\n";
+    solar::GeneratedLayout generated =
+        solar::generate_vertical_module_layout(candidates, options.grid);
+    solar::LayoutSummary layout_summary = generated.summary;
+    std::vector<solar::Cell> cells = std::move(generated.cells);
+    std::cout << "Generated layout: " << layout_summary.two_by_three_modules
+              << " 2x3 modules + " << layout_summary.one_by_three_modules
+              << " 1x3 modules = " << layout_summary.individual_cells
+              << " cells (row phase " << layout_summary.longitudinal_phase
+              << ")\n";
     solar::SimulationSummary summary =
         solar::simulate_cells(cells, scene, options.sun, options.simulation);
     std::cout << "Simulation finished in " << elapsed_seconds(start) << " s\n"
@@ -224,7 +290,8 @@ int main(int argc, char** argv) {
       solar::Sun interactive_sun = options.sun;
       solar::SimulationSettings interactive_settings = options.simulation;
       solar::show_viewer(mesh, scene, cells, interactive_sun,
-                         interactive_settings, summary, options.output_path);
+                         interactive_settings, summary, layout_summary,
+                         options.output_path);
     }
     return 0;
   } catch (const std::exception& error) {

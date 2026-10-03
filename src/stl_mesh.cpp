@@ -75,4 +75,50 @@ TriangleMesh load_binary_stl(const std::filesystem::path& path,
   return mesh;
 }
 
+TriangleMesh filter_eligible_shell(const TriangleMesh& source,
+                                   const ShellRegion& region) {
+  auto inside = [](const Vec3& point, const Vec3& minimum,
+                   const Vec3& maximum) {
+    return point.x >= minimum.x && point.x <= maximum.x &&
+           point.y >= minimum.y && point.y <= maximum.y &&
+           point.z >= minimum.z && point.z <= maximum.z;
+  };
+  if (region.minimum.x > region.maximum.x ||
+      region.minimum.y > region.maximum.y ||
+      region.minimum.z > region.maximum.z ||
+      region.minimum_upward_normal_z < 0.0f ||
+      region.minimum_upward_normal_z > 1.0f) {
+    throw std::runtime_error("Invalid eligible-shell region");
+  }
+
+  TriangleMesh result;
+  result.vertices.reserve(source.vertices.size() / 4U);
+  for (std::size_t first = 0; first < source.vertices.size(); first += 3U) {
+    const Vec3& a = source.vertices[first];
+    const Vec3& b = source.vertices[first + 1U];
+    const Vec3& c = source.vertices[first + 2U];
+    const Vec3 centroid = (a + b + c) / 3.0f;
+    if (!inside(centroid, region.minimum, region.maximum)) continue;
+    if (inside(centroid, region.exclusion_minimum,
+               region.exclusion_maximum))
+      continue;
+    const Vec3 geometric_normal = cross(b - a, c - a);
+    const float magnitude = length(geometric_normal);
+    if (magnitude <= 1.0e-12f ||
+        std::abs(geometric_normal.z) / magnitude <
+            region.minimum_upward_normal_z)
+      continue;
+    result.vertices.push_back(a);
+    result.vertices.push_back(b);
+    result.vertices.push_back(c);
+    result.bounds.include(a);
+    result.bounds.include(b);
+    result.bounds.include(c);
+  }
+  if (result.vertices.empty())
+    throw std::runtime_error(
+        "Eligible-shell cutoffs rejected every STL triangle");
+  return result;
+}
+
 }  // namespace solar

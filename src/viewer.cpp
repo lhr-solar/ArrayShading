@@ -1,4 +1,5 @@
 #include "solar/viewer.hpp"
+#include "solar/weather.hpp"
 
 #include <GL/glew.h>
 #define GLFW_INCLUDE_NONE
@@ -15,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <optional>
@@ -174,8 +176,10 @@ std::vector<RenderVertex> cell_vertices(const std::vector<Cell>& cells) {
 std::vector<RenderVertex> cell_outlines(const std::vector<Cell>& cells) {
   std::vector<RenderVertex> vertices;
   vertices.reserve(cells.size() * 8U);
-  const Vec3 color{0.015f, 0.025f, 0.035f};
   for (const Cell& cell : cells) {
+    const Vec3 color = cell.module_columns == 2U
+                           ? Vec3{0.10f, 0.78f, 0.96f}
+                           : Vec3{1.00f, 0.55f, 0.12f};
     const auto corners = cell_corners(cell);
     for (const int index : {0, 1, 1, 2, 2, 3, 3, 0})
       vertices.push_back({corners[static_cast<std::size_t>(index)], color});
@@ -377,11 +381,17 @@ std::string fixed(float value, int precision = 1) {
   return stream.str();
 }
 
+float wrapped_degrees(float value) {
+  value = std::fmod(value, 360.0f);
+  return value < 0.0f ? value + 360.0f : value;
+}
+
 }  // namespace
 
 void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
                  std::vector<Cell>& cells, Sun& sun,
                  SimulationSettings& settings, SimulationSummary& summary,
+                 const LayoutSummary& layout_summary,
                  const std::filesystem::path& output_path) {
   glfwSetErrorCallback(glfw_error);
   if (!glfwInit()) throw std::runtime_error("GLFW initialization failed");
@@ -495,10 +505,12 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
     float elevation = std::asin(std::clamp(sun.direction_to_sun.z, -1.0f, 1.0f)) *
                       180.0f / kPi;
     int ray_count = static_cast<int>(settings.hemisphere_samples);
+    int direct_samples =
+        static_cast<int>(settings.direct_samples_per_axis);
     int reflection_depth = static_cast<int>(settings.max_reflection_depth);
     bool show_shell = true;
     bool show_shell_heat = true;
-    bool show_cells = false;
+    bool show_cells = true;
     bool show_grid = true;
     bool show_sun = true;
     bool wireframe = false;
@@ -506,11 +518,38 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
     std::string status = "Simulation ready";
     Breakdown breakdown = calculate_breakdown(cells);
     std::optional<float> hovered_shell_irradiance;
+    double weather_latitude = 0.0;
+    double weather_longitude = 0.0;
+    float vehicle_heading = 0.0f;
+    std::optional<WeatherConditions> weather_conditions;
+    std::future<WeatherConditions> weather_future;
+    bool weather_request_running = false;
+    std::string weather_status = "Enter coordinates, then fetch current conditions";
 
     while (!glfwWindowShouldClose(window)) {
       glfwPollEvents();
       if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
         glfwSetWindowShouldClose(window, GLFW_TRUE);
+
+      if (weather_request_running &&
+          weather_future.wait_for(std::chrono::seconds(0)) ==
+              std::future_status::ready) {
+        try {
+          weather_conditions = weather_future.get();
+          const WeatherConditions& conditions = *weather_conditions;
+          sun.dni_w_m2 = conditions.dni_w_m2;
+          sun.dhi_w_m2 = conditions.dhi_w_m2;
+          azimuth = wrapped_degrees(conditions.sun.azimuth_degrees -
+                                    vehicle_heading);
+          elevation = conditions.sun.elevation_degrees;
+          weather_status = "Applied " + conditions.observation_time_utc +
+                           " UTC; run simulation to refresh cells";
+          inputs_dirty = true;
+        } catch (const std::exception& error) {
+          weather_status = error.what();
+        }
+        weather_request_running = false;
+      }
 
       ImGui_ImplOpenGL3_NewFrame();
       ImGui_ImplGlfw_NewFrame();
@@ -530,7 +569,7 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       ImGui::TextDisabled("Embree physics + OpenGL visualization");
       ImGui::Spacing();
 
-      ImGui::BeginChild("Summary", {0.0f, 134.0f}, true);
+      ImGui::BeginChild("Summary", {0.0f, 188.0f}, true);
       ImGui::TextDisabled("CURRENT RESULT");
       ImGui::TextColored({0.98f, 0.78f, 0.24f, 1.0f}, "%s W/m2",
                          fixed(summary.area_weighted_irradiance_w_m2, 1).c_str());
@@ -538,15 +577,63 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       ImGui::TextDisabled("area weighted");
       draw_label_value("Incident optical power",
                        fixed(summary.incident_solar_power_w, 1) + " W");
-      draw_label_value("Accepted cells", std::to_string(summary.cell_count));
+      draw_label_value("Selected cells", std::to_string(summary.cell_count));
+      draw_label_value("2x3 modules",
+                       std::to_string(layout_summary.two_by_three_modules));
+      draw_label_value("1x3 modules",
+                       std::to_string(layout_summary.one_by_three_modules));
       draw_label_value("Active area", fixed(summary.active_area_m2, 3) + " m2");
       ImGui::EndChild();
 
       ImGui::Spacing();
+      ImGui::TextDisabled("OPEN-METEO LOCATION");
+      ImGui::SetNextItemWidth(-1.0f);
+      ImGui::InputDouble("Latitude", &weather_latitude, 0.0, 0.0, "%.5f");
+      ImGui::SetNextItemWidth(-1.0f);
+      ImGui::InputDouble("Longitude", &weather_longitude, 0.0, 0.0, "%.5f");
+      const bool heading_changed = ImGui::SliderFloat(
+          "Vehicle heading", &vehicle_heading, 0.0f, 360.0f, "%.1f deg");
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Clockwise from true north; 0 is north, 90 is east");
+      if (heading_changed && weather_conditions) {
+        azimuth = wrapped_degrees(
+            weather_conditions->sun.azimuth_degrees - vehicle_heading);
+        inputs_dirty = true;
+      }
+      if (weather_request_running) ImGui::BeginDisabled();
+      if (ImGui::Button(weather_request_running ? "FETCHING..."
+                                                : "FETCH CURRENT WEATHER",
+                        {-1.0f, 0.0f}) &&
+          !weather_request_running) {
+        try {
+          const double latitude = weather_latitude;
+          const double longitude = weather_longitude;
+          weather_future = std::async(std::launch::async, [latitude, longitude] {
+            return fetch_open_meteo_current(latitude, longitude);
+          });
+          weather_request_running = true;
+          weather_status = "Contacting Open-Meteo...";
+        } catch (const std::exception& error) {
+          weather_status = error.what();
+        }
+      }
+      if (weather_request_running) ImGui::EndDisabled();
+      ImGui::TextWrapped("%s", weather_status.c_str());
+      if (weather_conditions) {
+        draw_label_value("Cloud cover",
+                         fixed(weather_conditions->cloud_cover_percent, 0) + "%");
+        draw_label_value("Air temperature",
+                         fixed(weather_conditions->air_temperature_c, 1) + " C");
+        draw_label_value("Geographic sun azimuth",
+                         fixed(weather_conditions->sun.azimuth_degrees, 1) +
+                             " deg");
+      }
+
+      ImGui::Spacing();
       ImGui::TextDisabled("SUN & SKY");
-      inputs_dirty |= ImGui::SliderFloat("Azimuth", &azimuth, 0.0f, 360.0f,
-                                         "%.1f deg");
-      inputs_dirty |= ImGui::SliderFloat("Elevation", &elevation, -5.0f, 90.0f,
+      inputs_dirty |= ImGui::SliderFloat("Car-relative azimuth", &azimuth,
+                                         0.0f, 360.0f, "%.1f deg");
+      inputs_dirty |= ImGui::SliderFloat("Elevation", &elevation, -90.0f, 90.0f,
                                          "%.1f deg");
       inputs_dirty |=
           ImGui::SliderFloat("DNI", &sun.dni_w_m2, 0.0f, 1200.0f, "%.0f W/m2");
@@ -557,12 +644,20 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
 
       ImGui::Spacing();
       ImGui::TextDisabled("RAY TRACING");
+      if (ImGui::SliderInt("Direct grid axis", &direct_samples, 1, 7)) {
+        direct_samples = std::max(1, direct_samples);
+        inputs_dirty = true;
+      }
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("N x N direct-shadow samples across each cell");
       if (ImGui::SliderInt("Sky rays / cell", &ray_count, 8, 512)) {
         ray_count = std::max(8, ray_count);
         inputs_dirty = true;
       }
       if (ImGui::SliderInt("Reflection depth", &reflection_depth, 0, 4))
         inputs_dirty = true;
+      settings.direct_samples_per_axis =
+          static_cast<std::uint32_t>(direct_samples);
       settings.hemisphere_samples = static_cast<std::uint32_t>(ray_count);
       settings.max_reflection_depth =
           static_cast<std::uint32_t>(reflection_depth);
@@ -618,9 +713,14 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       ImGui::SameLine(220.0f);
       ImGui::Checkbox("Wireframe", &wireframe);
       ImGui::Checkbox("Live shell heat", &show_shell_heat);
-      ImGui::Checkbox("Candidate cells", &show_cells);
+      ImGui::Checkbox("Generated layout", &show_cells);
       ImGui::SameLine(180.0f);
       ImGui::Checkbox("Sun direction", &show_sun);
+      if (show_cells) {
+        ImGui::TextColored({0.10f, 0.78f, 0.96f, 1.0f}, "2x3 outline");
+        ImGui::SameLine(150.0f);
+        ImGui::TextColored({1.00f, 0.55f, 0.12f, 1.0f}, "1x3 outline");
+      }
       if (ImGui::Button("Reset camera", {-1.0f, 0.0f})) camera.reset();
 
       ImGui::Spacing();
@@ -736,7 +836,7 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
         glDisable(GL_POLYGON_OFFSET_FILL);
         glUniform1i(glGetUniformLocation(program, "uUnlit"), GL_TRUE);
         glBindVertexArray(outlines_vao);
-        glLineWidth(1.0f);
+        glLineWidth(2.0f);
         glDrawArrays(GL_LINES, 0,
                      static_cast<GLsizei>(rendered_outlines.size()));
       }

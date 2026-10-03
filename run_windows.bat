@@ -144,7 +144,7 @@ if errorlevel 1 (
   exit /b 20
 )
 
-rem vcpkg installs Embree, GLFW, GLEW, GLM, and Dear ImGui from vcpkg.json.
+rem vcpkg installs Embree, GLFW, GLEW, GLM, Dear ImGui, CPR, and JSON support.
 set "VCPKG_ROOT=%USERPROFILE%\vcpkg"
 if not exist "%VCPKG_ROOT%\vcpkg.exe" (
   if not exist "%VCPKG_ROOT%\.git" (

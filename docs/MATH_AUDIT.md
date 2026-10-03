@@ -14,6 +14,31 @@ to catch sign, normalization, occlusion, and unit errors.
 - Rays start with a configurable metric epsilon to avoid self-intersection. Other facets of
   the same STL are not excluded, so one part of a concave shell can shadow another.
 
+## Provisional 2x3 / 1x3 layout selection
+
+Let `C(r,c)` mean that the projected cell location at longitudinal row `r` and lateral
+column `c` exists and lies on the eligible upper shell. A 1x3 module beginning at `(r,c)` is
+feasible when all three locations exist and their surface normals remain coherent:
+
+```text
+C(r+i,c) = true                           for i in {0,1,2}
+n(r,c) dot n(r+i,c) >= 0.85               for i in {0,1,2}
+```
+
+A 2x3 module applies the same test to both `c` and `c+1`. For each row phase `p` in
+`{0,1,2}`, the generator visits `r = p, p+3, ...`, consumes every feasible adjacent pair as
+a 2x3, and then consumes each feasible unpaired column as a 1x3. It selects the phase using
+the lexicographic objective:
+
+```text
+maximize (number of 2x3 modules, number of 1x3 modules)
+```
+
+The selected modules cannot overlap because rows advance in three-row bands and consumed
+columns advance past each accepted module. This objective implements the current stated
+preference but is restricted to a common three-row phase; it is not yet the route-weighted
+global set-packing formulation in the development plan.
+
 ## Direct beam
 
 For a panel normal **n** and unit direction to the sun **s**:
@@ -22,8 +47,11 @@ For a panel normal **n** and unit direction to the sun **s**:
 E_direct = DNI × max(0, n · s) × visibility
 ```
 
-`visibility` is 0 or 1 from a hard shadow ray. There is no inverse-square factor because DNI
-is already the irradiance at the vehicle and the sun is modeled as a directional source.
+`visibility` is the visible fraction of a deterministic `N x N` sample grid across the cell
+footprint. Every sample launches its own hard shadow ray, so it is 0 for a fully shaded cell,
+1 for a fully illuminated cell, and intermediate for a partially shaded cell. There is no
+inverse-square factor because DNI is already the irradiance at the vehicle and the sun is
+modeled as a directional source.
 
 Analytic tests cover a horizontal panel, a 60° tilted panel, and full occultation.
 
@@ -87,9 +115,11 @@ and multi-bounce scene radiance, multiplied by `ρ k_s` at each bounce and bound
 
 ## Cell projection, spatial aggregation, and incident power
 
-Candidate cell centers form a 125 mm plus gap grid in world `(x,y)`. A vertical ray finds the
-topmost shell intersection. Nearby top intersections in `±x` and `±y` estimate tangents, and
-the local cell normal is:
+Candidate cell centers form a 125 mm plus gap grid in world `(x,y)`. Placement triangles are
+first filtered by a configurable XYZ inclusion box, a central canopy exclusion prism, and a
+minimum absolute normal-Z component. A vertical ray finds the topmost eligible intersection;
+the unfiltered STL is still used by all later visibility rays. Nearby eligible intersections
+in `±x` and `±y` estimate tangents, and the local cell normal is:
 
 ```text
 t_x = p(x+δ,y) - p(x-δ,y)
@@ -97,9 +127,10 @@ t_y = p(x,y+δ) - p(x,y-δ)
 n = normalize(t_x × t_y), with n_z > 0
 ```
 
-Cells without a top-shell hit or below the configured minimum `n_z` are omitted. The current
-C++ implementation evaluates the center point of each accepted cell. With published Maxeon
-Gen III active area `A_active = 0.0153 m²`:
+Cells without a top-shell hit or below the configured minimum `n_z` are omitted. Direct-beam
+visibility is averaged across the cell footprint; diffuse-sky and reflected irradiance are
+currently evaluated at the cell center. With published Maxeon Gen III active area
+`A_active = 0.0153 m²`:
 
 ```text
 E_cell = mean(E_direct + E_sky + E_reflected)
@@ -126,12 +157,31 @@ eligible-shell classification. It is therefore a visual orientation diagnostic, 
 output. The candidate-cell values and exported CSV continue to use Embree visibility,
 hemisphere integration, and recursive reflection.
 
+## Weather and geographic sun direction
+
+The Open-Meteo integration supplies DNI and DHI for a requested WGS84 coordinate at the
+returned UTC model time step. Solar declination, equation of time, hour angle, zenith, and
+geographic azimuth are calculated locally using the NOAA solar-position approximation.
+Geographic azimuth is clockwise from true north. For a vehicle heading `h` measured using
+the same convention, the simulator's car-relative azimuth is:
+
+```text
+azimuth_car = wrap_0_360(azimuth_geographic - h)
+```
+
+The solver consumes Open-Meteo DNI and DHI directly. Cloud cover is retained as metadata and
+is not an additional attenuation multiplier because its effect is already represented in the
+weather model's irradiance components.
+
 ## Validation currently automated
 
 - Vector normalization and cross-product orientation.
 - STL-to-world scale, rotation, and translation convention.
 - Geographic azimuth/elevation conversion, including overhead sun.
+- UTC/location solar-position elevation and azimuth normalization.
 - Unit-length, upper-hemisphere cosine-weighted samples.
+- A complete 3x3 placement patch resolves to one preferred 2x3 module plus one 1x3 fill
+  module, with module dimensions retained on each cell.
 
 The complete Embree/OpenGL target still needs its first target-workstation build and the
 canonical radiometry/integration test suite described below.
