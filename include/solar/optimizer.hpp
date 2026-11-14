@@ -78,10 +78,11 @@ CellTrackProfiles sample_cell_track_profiles(
     const OptimizationProgressCallback& progress = {},
     const OptimizationStopCallback& stop = {});
 
-// Zone indices correspond to CellTrackProfiles::cells. Each zone is connected
-// by local module neighbors in XY, independent of the physical packing gap.
+// Zone indices correspond to CellTrackProfiles::cells. K-medoids can require
+// each zone to be connected by local module neighbors in XY.
 std::vector<std::size_t> group_track_profiles(
-    const CellTrackProfiles& profiles, std::size_t zone_count);
+    const CellTrackProfiles& profiles, std::size_t zone_count,
+    bool require_connected = true);
 
 OptimizedLayout solve_module_packing(
     const std::vector<ModuleCandidate>& candidates,

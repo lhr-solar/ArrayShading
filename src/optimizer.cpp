@@ -407,7 +407,7 @@ std::vector<ModuleCandidate> generate_module_candidates(
 }
 
 std::vector<std::size_t> group_track_profiles(
-    const CellTrackProfiles& profiles, std::size_t zone_count) {
+    const CellTrackProfiles& profiles, std::size_t zone_count, bool require_connected) {
   if ((zone_count != 2 && zone_count != 3) || profiles.race.samples.empty() ||
       profiles.irradiance_w_m2.size() != profiles.race.samples.size())
     throw std::invalid_argument("Invalid track profiles or zone count");
@@ -438,32 +438,31 @@ std::vector<std::size_t> group_track_profiles(
       curves[i][t] /= static_cast<double>(modules[i].size());
     }
   }
-  std::vector<std::array<double, 2>> centers(n);
-  for (std::size_t i = 0; i < n; ++i) {
-    auto& [x, y] = centers[i];
-    for (auto cell : modules[i]) {
-      const auto& p = profiles.cells[cell].center;
-      if (!std::isfinite(p.x) || !std::isfinite(p.y))
-        throw std::invalid_argument("Invalid module position in track profile");
-      x += p.x; y += p.y;
-    }
-    x /= modules[i].size(); y /= modules[i].size();
-  }
-  // Gabriel neighbors: the disc with the two centers as its diameter must
-  // not contain another module center. A hole in coverage doesn't block a
-  // link, but a module between them prevents a shortcut past it. The graph
-  // contains a Euclidean spanning tree, so gaps don't strand modules.
   std::vector<std::vector<std::size_t>> neighbors(n);
-  for (std::size_t i = 0; i < n; ++i) for (std::size_t j = 0; j < i; ++j) {
-    const auto [ax, ay] = centers[i];
-    const auto [bx, by] = centers[j];
-    bool adjacent = true;
-    for (std::size_t k = 0; k < n; ++k) {
-      if (k == i || k == j) continue;
-      const auto [x, y] = centers[k];
-      if ((x-ax)*(x-bx) + (y-ay)*(y-by) < 0) { adjacent = false; break; }
+  if (require_connected) {
+    std::vector<std::array<double, 2>> centers(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      auto& [x, y] = centers[i];
+      for (auto cell : modules[i]) {
+        const auto& p = profiles.cells[cell].center;
+        if (!std::isfinite(p.x) || !std::isfinite(p.y))
+          throw std::invalid_argument("Invalid module position in track profile");
+        x += p.x; y += p.y;
+      }
+      x /= modules[i].size(); y /= modules[i].size();
     }
-    if (adjacent) { neighbors[i].push_back(j); neighbors[j].push_back(i); }
+    // Gabriel neighbors bridge empty gaps, but don't jump over another module.
+    for (std::size_t i = 0; i < n; ++i) for (std::size_t j = 0; j < i; ++j) {
+      const auto [ax, ay] = centers[i];
+      const auto [bx, by] = centers[j];
+      bool adjacent = true;
+      for (std::size_t k = 0; k < n; ++k) {
+        if (k == i || k == j) continue;
+        const auto [x, y] = centers[k];
+        if ((x-ax)*(x-bx) + (y-ay)*(y-by) < 0) { adjacent = false; break; }
+      }
+      if (adjacent) { neighbors[i].push_back(j); neighbors[j].push_back(i); }
+    }
   }
   const auto difference = [&](const std::vector<double>& a, const std::vector<double>& b) {
     double sum = 0;
@@ -473,6 +472,10 @@ std::vector<std::size_t> group_track_profiles(
     }
     return sum / total_duration;
   };
+  std::vector<std::vector<double>> distances(n, std::vector<double>(n));
+  for (std::size_t i = 0; i < n; ++i) for (std::size_t j = 0; j < i; ++j)
+    distances[i][j] = distances[j][i] = difference(curves[i], curves[j]);
+
   const auto unassigned = std::numeric_limits<std::size_t>::max();
   std::vector<std::size_t> assignments(n, unassigned), seeds{0};
   assignments[0] = 0;
@@ -480,28 +483,98 @@ std::vector<std::size_t> group_track_profiles(
     std::size_t best = unassigned; double best_distance = -1;
     for (std::size_t i = 0; i < n; ++i) if (assignments[i] == unassigned) {
       double nearest = std::numeric_limits<double>::infinity();
-      for (auto seed : seeds) nearest = std::min(nearest, difference(curves[i], curves[seed]));
+      for (auto seed : seeds) nearest = std::min(nearest, distances[i][seed]);
       if (nearest > best_distance) { best_distance = nearest; best = i; }
     }
     assignments[best] = seeds.size(); seeds.push_back(best);
   }
-  std::vector<std::vector<double>> means(zone_count, std::vector<double>(count));
-  std::vector<std::size_t> zone_cells(zone_count);
-  for (std::size_t z = 0; z < zone_count; ++z) { means[z] = curves[seeds[z]]; zone_cells[z] = modules[seeds[z]].size(); }
-  for (std::size_t remaining = n - zone_count; remaining; --remaining) {
-    std::size_t best = unassigned, best_zone = unassigned; double cost = std::numeric_limits<double>::infinity();
-    for (std::size_t i = 0; i < n; ++i) if (assignments[i] == unassigned)
-      for (auto j : neighbors[i]) if (assignments[j] != unassigned) {
-        const auto z = assignments[j];
-        const auto value = difference(curves[i], means[z]);
-        if (value < cost) { cost = value; best = i; best_zone = z; }
+  if (require_connected) {
+    // Initialize with the existing region-growing pass, then refine it below.
+    std::vector<std::vector<double>> means(zone_count, std::vector<double>(count));
+    std::vector<std::size_t> zone_cells(zone_count);
+    for (std::size_t z = 0; z < zone_count; ++z) { means[z] = curves[seeds[z]]; zone_cells[z] = modules[seeds[z]].size(); }
+    for (std::size_t remaining = n - zone_count; remaining; --remaining) {
+      std::size_t best = unassigned, best_zone = unassigned; double cost = std::numeric_limits<double>::infinity();
+      for (std::size_t i = 0; i < n; ++i) if (assignments[i] == unassigned)
+        for (auto j : neighbors[i]) if (assignments[j] != unassigned) {
+          const auto z = assignments[j];
+          const auto value = difference(curves[i], means[z]);
+          if (value < cost) { cost = value; best = i; best_zone = z; }
+        }
+      if (best == unassigned) throw std::runtime_error("Unable to grow connected zones");
+      assignments[best] = best_zone;
+      const auto old_count = zone_cells[best_zone], added = modules[best].size();
+      for (std::size_t t = 0; t < count; ++t)
+        means[best_zone][t] = (means[best_zone][t]*old_count + curves[best][t]*added) / (old_count + added);
+      zone_cells[best_zone] += added;
+    }
+  } else {
+    for (std::size_t i = 0; i < n; ++i) if (assignments[i] == unassigned) {
+      std::size_t best_zone = 0;
+      for (std::size_t z = 1; z < zone_count; ++z)
+        if (distances[i][seeds[z]] < distances[i][seeds[best_zone]]) best_zone = z;
+      assignments[i] = best_zone;
+    }
+  }
+
+  // Refit each affected zone's medoid for every trial move. The medoid is
+  // always an actual member; a 2x3 contributes twice the weight of a 1x3.
+  std::vector<std::size_t> sizes(zone_count);
+  std::vector<std::vector<double>> costs(zone_count, std::vector<double>(n));
+  const auto medoid_cost = [&](std::size_t zone, std::size_t remove, std::size_t add) {
+    double best = std::numeric_limits<double>::infinity();
+    for (std::size_t m = 0; m < n; ++m) {
+      if (m != add && (m == remove || assignments[m] != zone)) continue;
+      double cost = costs[zone][m];
+      if (remove != unassigned) cost -= modules[remove].size() * distances[remove][m];
+      if (add != unassigned) cost += modules[add].size() * distances[add][m];
+      best = std::min(best, cost);
+    }
+    return best;
+  };
+  const auto connected_after_removal = [&](std::size_t zone, std::size_t remove) {
+    std::vector<bool> seen(n);
+    seen[remove] = true;
+    std::vector<std::size_t> frontier;
+    for (std::size_t i = 0; i < n; ++i) if (i != remove && assignments[i] == zone) {
+      frontier.push_back(i); seen[i] = true; break;
+    }
+    for (std::size_t j = 0; j < frontier.size(); ++j)
+      for (auto other : neighbors[frontier[j]]) if (!seen[other] && assignments[other] == zone) {
+        frontier.push_back(other); seen[other] = true;
       }
-    if (best == unassigned) throw std::runtime_error("Unable to grow contiguous zones");
-    assignments[best] = best_zone;
-    const auto old_count = zone_cells[best_zone], added = modules[best].size();
-    for (std::size_t t = 0; t < count; ++t)
-      means[best_zone][t] = (means[best_zone][t]*old_count + curves[best][t]*added) / (old_count + added);
-    zone_cells[best_zone] += added;
+    return frontier.size() == sizes[zone] - 1;
+  };
+  for (;;) {
+    std::fill(sizes.begin(), sizes.end(), 0);
+    for (auto& row : costs) std::fill(row.begin(), row.end(), 0.0);
+    for (std::size_t i = 0; i < n; ++i) {
+      const auto zone = assignments[i];
+      ++sizes[zone];
+      for (std::size_t m = 0; m < n; ++m)
+        costs[zone][m] += modules[i].size() * distances[i][m];
+    }
+    std::vector<double> current(zone_count);
+    for (std::size_t z = 0; z < zone_count; ++z) current[z] = medoid_cost(z, unassigned, unassigned);
+    std::size_t best_module = unassigned, best_zone = unassigned;
+    double best_improvement = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+      const auto source = assignments[i];
+      if (sizes[source] <= 1 || (require_connected && !connected_after_removal(source, i))) continue;
+      const auto source_cost = medoid_cost(source, i, unassigned);
+      for (std::size_t target = 0; target < zone_count; ++target) {
+        if (source == target || (require_connected &&
+            std::none_of(neighbors[i].begin(), neighbors[i].end(), [&](auto j) { return assignments[j] == target; }))) continue;
+        const double before = current[source] + current[target];
+        const double after = source_cost + medoid_cost(target, unassigned, i);
+        const double improvement = before - after;
+        if (improvement > best_improvement && improvement > 1.0e-12 * std::max(1.0, before)) {
+          best_module = i; best_zone = target; best_improvement = improvement;
+        }
+      }
+    }
+    if (best_module == unassigned) break;
+    assignments[best_module] = best_zone;
   }
   std::vector<std::size_t> result(profiles.cells.size());
   for (std::size_t i = 0; i < n; ++i) for (auto cell : modules[i]) result[cell] = assignments[i];

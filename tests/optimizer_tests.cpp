@@ -299,6 +299,32 @@ void zone_grouping_bridges_gaps_without_skipping_the_middle() {
                               {200, 200, 200, 100, 100, 100, 200, 200, 200}};
   const auto ends = solar::group_track_profiles(profiles, 2);
   require(ends[0] != ends[6], "matching front and rear modules cannot jump past the intervening zone");
+  const auto unrestricted = solar::group_track_profiles(profiles, 2, false);
+  require(unrestricted[0] == unrestricted[6] && unrestricted[0] != unrestricted[3],
+          "unrestricted k-medoids can group matching profiles across an intervening zone");
+}
+
+void k_medoids_refines_initial_assignments() {
+  solar::CellTrackProfiles profiles;
+  solar::RaceSample sample; sample.duration_seconds = 5;
+  profiles.race.samples.push_back(sample);
+  auto& irradiance = profiles.irradiance_w_m2.emplace_back();
+  std::uint32_t id = 0;
+  for (float value : {0, 41, 80, 81, 82, 100}) {
+    auto candidate = module(0, 0);
+    ++id;
+    for (auto cell : candidate.cells) {
+      cell.module_id = id;
+      cell.center.y += static_cast<float>(id);
+      profiles.cells.push_back(cell);
+      irradiance.push_back(value);
+    }
+  }
+  for (bool require_connected : {true, false}) {
+    const auto zones = solar::group_track_profiles(profiles, 2, require_connected);
+    require(zones[0] != zones[3] && zones[3] == zones[15],
+            "medoid refinement should be able to revise an initial assignment");
+  }
 }
 
 void zone_grouping_can_split_left_and_right() {
@@ -483,6 +509,7 @@ int main() {
     track_profiles_preserve_each_sample_and_cell();
     zone_grouping_bridges_gaps_without_skipping_the_middle();
     zone_grouping_can_split_left_and_right();
+    k_medoids_refines_initial_assignments();
     exclusion_region_rejects_canopy_area();
     invalid_settings_are_rejected();
     timed_raytracing_and_packing_match_analytical_energy();

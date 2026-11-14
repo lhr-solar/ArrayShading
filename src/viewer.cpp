@@ -733,6 +733,8 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
     std::optional<CellTrackProfiles> track_profiles;
     std::vector<std::size_t> zone_assignments;
     int zone_display = 0;
+    bool require_connected_zones = true;
+    bool displayed_connected_zones = true;
     std::string zone_status;
     std::future<CellTrackProfiles> profiles_future;
     bool profiles_running = false;
@@ -1139,11 +1141,14 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
       if (profiles_running) ImGui::Text("Track samples completed: %zu", profiles_done->load());
       if (!profiles_status.empty()) ImGui::TextWrapped("%s", profiles_status.c_str());
       ImGui::BeginDisabled(!track_profiles || profiles_running || packing_running || race_running || car_loading);
+      ImGui::Checkbox("Keep zones spatially connected", &require_connected_zones);
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Off: group by irradiance alone, even if a zone spans separate parts of the shell.");
       for (int count : {2, 3}) {
         const std::string label = std::to_string(count) + " MPPT zones";
         if (ImGui::Button(label.c_str())) {
           try {
-            auto assignment = group_track_profiles(*track_profiles, static_cast<std::size_t>(count));
+            auto assignment = group_track_profiles(*track_profiles, static_cast<std::size_t>(count), require_connected_zones);
             const std::array<Vec3, 3> colors{{{0.06f, 0.72f, 0.95f}, {0.99f, 0.54f, 0.12f}, {0.68f, 0.39f, 0.91f}}};
             std::vector<RenderVertex> zone_vertices;
             zone_vertices.reserve(cells.size() * 6U);
@@ -1154,17 +1159,19 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
             }
             zone_assignments = std::move(assignment);
             zone_display = count;
+            displayed_connected_zones = require_connected_zones;
             rendered_cells = std::move(zone_vertices);
             upload_vertices(cells_vbo, rendered_cells);
             show_cells = true; show_cell_heat = true;
-            zone_status = "Coherent irradiance-profile zones; empty gaps are allowed. No electrical MPPT losses modeled.";
+            zone_status = "Grouped by irradiance with k-medoids. No electrical MPPT losses modeled.";
           } catch (const std::exception& error) { zone_status = error.what(); }
         }
         if (count == 2) ImGui::SameLine();
       }
       ImGui::EndDisabled();
       if (zone_display) {
-        ImGui::Text("Displayed: %d zones", zone_display);
+        ImGui::Text("Displayed: %d zones (%s)", zone_display,
+                    displayed_connected_zones ? "connected" : "irradiance only");
         ImGui::TextColored({0.06f, 0.72f, 0.95f, 1}, "Zone 1"); ImGui::SameLine();
         ImGui::TextColored({0.99f, 0.54f, 0.12f, 1}, "Zone 2");
         if (zone_display == 3) { ImGui::SameLine(); ImGui::TextColored({0.68f, 0.39f, 0.91f, 1}, "Zone 3"); }
