@@ -1112,7 +1112,7 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
               car_snapshot->scene, grid_snapshot, top_snapshot->surface.region, packing_settings);
         });
         packing_running = true;
-        packing_status = "Following the shell outline inward, trying 2x3 modules and filling with 1x3s...";
+        packing_status = "Packing the straight deck on a grid, then following the curved nose...";
       }
       ImGui::EndDisabled();
       if (!packing_status.empty()) ImGui::TextWrapped("%s", packing_status.c_str());

@@ -580,12 +580,13 @@ GeneratedLayout pack_shell_perimeter_inward(
   GeneratedLayout result;
   struct Placement { Bounds footprint; ModuleCandidate module; };
   std::vector<Placement> selected;
-  const auto place = [&](Vec3 anchor, float yaw, std::uint32_t columns) {
+  const auto place = [&](Vec3 anchor, float yaw, std::uint32_t columns, float spacing = 0.0f) {
     const Vec3 u{std::cos(yaw), std::sin(yaw), 0}, v{-u.y, u.x, 0};
     ModuleCandidate candidate;
     Bounds footprint;
     for (int row = 0; row < 3; ++row) for (std::uint32_t col = 0; col < columns; ++col) {
-      const Vec3 p = anchor + u * ((col - 0.5f*(columns-1))*pitch_u) + v * ((row-1)*pitch_v);
+      const Vec3 p = anchor + u * ((col - 0.5f*(columns-1))*(pitch_u+spacing)) +
+                     v * ((row-1)*(pitch_v+spacing));
       auto cell = supported_cell(placement_scene, p.x, p.y, start_z, grid, region, yaw, true);
       if (!cell || !conform_shell_cell(*cell, placement_scene, complete_trace_scene, grid)) return false;
       for (const auto& other : candidate.cells)
@@ -629,6 +630,106 @@ GeneratedLayout pack_shell_perimeter_inward(
     return widest;
   };
   const bool rear_at_high_y = end_width(true) >= end_width(false);
+  const float rear_y = rear_at_high_y ? bounds.maximum.y : bounds.minimum.y;
+  const float toward_nose = rear_at_high_y ? -1.0f : 1.0f;
+  const auto from_rear = [&](float y) { return toward_nose * (y - rear_y); };
+  // Follow both outside edges separately. A canopy hole or a notch on one
+  // side must not turn the other straight side strip into an angled zone.
+  struct RowEdges { int left; int right; };
+  std::vector<RowEdges> row_edges(static_cast<std::size_t>(ny), {nx, -1});
+  int outside_left = nx, outside_right = -1;
+  for (int y = 1; y < ny-1; ++y) {
+    auto& [left, right] = row_edges[y];
+    for (int x = 1; x < nx-1; ++x) if (depth[index(x,y)] > 0) {
+      left = std::min(left, x); right = x;
+    }
+    outside_left = std::min(outside_left, left);
+    outside_right = std::max(outside_right, right);
+  }
+  const int taper = static_cast<int>(std::ceil(std::min(grid.width_m / (4*step), static_cast<float>(nx))));
+  float nose_start = bounds.extent().y;
+  int consecutive_narrow = 0;
+  for (int row = 1; row < ny-1; ++row) {
+    const int y = rear_at_high_y ? ny-1-row : row;
+    const float distance = from_rear(origin.y + y*step);
+    if (distance < pitch_v) continue;
+    const auto [left, right] = row_edges[y];
+    if (left <= right && left-outside_left >= taper && outside_right-right >= taper) {
+      ++consecutive_narrow;
+      if (consecutive_narrow >= end_rows) {
+        nose_start = std::clamp(distance - (end_rows-1)*step, 0.0f, bounds.extent().y);
+        break;
+      }
+    } else consecutive_narrow = 0;
+  }
+
+  // A single lattice keeps the back deck aligned. Try a few translations of
+  // that lattice so a marginally unsupported edge or canopy doesn't set the
+  // phase of every row. Modules always contain whole cells on the same grid.
+  const auto grid_points = [](float extent, float width, float pitch) {
+    return extent < width ? 0 : 1 + static_cast<int>(std::floor((extent-width) / pitch));
+  };
+  const auto fill_grid = [&](float x_shift, float y_shift, float spacing, int phase, bool remainder) {
+    const float lattice_u = pitch_u + spacing, lattice_v = pitch_v + spacing;
+    const int grid_columns = grid_points(bounds.extent().x, grid.width_m, lattice_u);
+    const int grid_rows = grid_points(bounds.extent().y, grid.height_m, lattice_v);
+    const auto grid_point = [&](int col, int row) {
+      return Vec3{bounds.minimum.x + grid.width_m*0.5f + x_shift + col*lattice_u,
+                  rear_y + toward_nose*(grid.height_m*0.5f + y_shift + row*lattice_v), 0};
+    };
+    const auto row_pass = [&](int first, int stride, bool skip_phase) {
+      for (int row = first; row+2 < grid_rows; row += stride) {
+        if (skip_phase && row % 3 == phase) continue;
+        for (int col = 0; col < grid_columns;) {
+          const auto anchor = grid_point(col, row+1);
+          if (!remainder && from_rear(anchor.y) >= nose_start) break;
+          if (col+1 < grid_columns && place(anchor + Vec3{lattice_u*0.5f,0,0}, 0, 2, spacing)) col += 2;
+          else { place(anchor, 0, 1, spacing); ++col; }
+        }
+      }
+    };
+    if (!remainder) row_pass(phase, 3, false);
+    row_pass(0, 1, !remainder);
+    // Square cells also permit crosswise 1x3s without leaving the lattice.
+    // These fill short gaps that can't accommodate a longitudinal module.
+    if (std::abs(pitch_u-pitch_v) <= 1.0e-6f) {
+      for (int row = 0; row < grid_rows; ++row) for (int col = 1; col+1 < grid_columns; ++col) {
+        const auto anchor = grid_point(col, row);
+        if (!remainder && from_rear(anchor.y) >= nose_start) break;
+        place(anchor, kPi*0.5f, 1, spacing);
+      }
+    }
+  };
+  GeneratedLayout best_grid;
+  std::vector<Placement> best_placements;
+  float best_x_shift = 0, best_y_shift = 0, best_spacing = 0;
+  // Tilting or lifting cells onto curved triangles can narrow the projected
+  // gap even at nominal pitch. Try small clearances rather than dropping a row.
+  for (float spacing : {0.0f, grid.width_m*0.008f, grid.width_m*0.016f}) {
+    const auto free_space = [&](float extent, float width, float pitch) {
+      return std::max(0.0f, extent - width - (grid_points(extent, width, pitch)-1)*pitch);
+    };
+    const float free_width = free_space(bounds.extent().x, grid.width_m, pitch_u+spacing);
+    const float free_length = free_space(bounds.extent().y, grid.height_m, pitch_v+spacing);
+    for (float x_shift : {free_width*0.5f, 0.0f, free_width}) {
+      for (float y_shift : {free_length*0.5f, 0.0f, free_length}) {
+        for (int phase : {0, 1, 2}) {
+          fill_grid(x_shift, y_shift, spacing, phase, false);
+          if (result.cells.size() > best_grid.cells.size() ||
+              (result.cells.size() == best_grid.cells.size() &&
+               result.summary.two_by_three_modules > best_grid.summary.two_by_three_modules)) {
+            best_grid = std::move(result);
+            best_placements = std::move(selected);
+            best_x_shift = x_shift; best_y_shift = y_shift; best_spacing = spacing;
+          }
+          result = {};
+          selected.clear();
+        }
+      }
+    }
+  }
+  result = std::move(best_grid);
+  selected = std::move(best_placements);
   const float yaw_adjustment = static_cast<float>(std::min(settings.angle_step_degrees, 15.0)) * kPi / 180.0f;
   const auto fill_contour = [&](float inset, std::uint32_t columns) {
     // Extract oriented edges of the inset footprint. Interior is on the left.
@@ -673,6 +774,8 @@ GeneratedLayout pack_shell_perimeter_inward(
         };
         const float half_span = std::min(1.5f*pitch_v, perimeter*0.125f);
         for (float s = 0; s < perimeter;) {
+          const auto anchor = point_at(s);
+          if (from_rear(anchor.y) < nose_start) { s += step; continue; }
           const Vec3 tangent = point_at(s+half_span) - point_at(s-half_span);
           if (std::hypot(tangent.x,tangent.y) < step) { s += step; continue; }
           const float heading = std::atan2(tangent.y,tangent.x);
@@ -680,7 +783,8 @@ GeneratedLayout pack_shell_perimeter_inward(
           bool placed = false;
           for (float nudge : {0.0f, 0.5f, 1.0f}) {
             for (float angle : {0.0f, -0.5f, 0.5f, -1.0f, 1.0f}) {
-              if (place(point_at(s) + inward*(nudge*step), heading - kPi*0.5f + angle*yaw_adjustment, columns)) {
+              const auto p = anchor + inward*(nudge*step);
+              if (from_rear(p.y) >= nose_start && place(p, heading - kPi*0.5f + angle*yaw_adjustment, columns)) {
                 placed = true; break;
               }
             }
@@ -701,6 +805,7 @@ GeneratedLayout pack_shell_perimeter_inward(
   // split in the footprint, a leftover pocket need not line up with a lane.
   for (float inset = (grid.width_m + pitch_u)*0.5f; inset < max_depth; inset += pitch_u)
     fill_contour(inset, 1);
+  fill_grid(best_x_shift, best_y_shift, best_spacing, 0, true);
   result.summary.individual_cells = result.cells.size();
   return result;
 }

@@ -190,11 +190,15 @@ void shell_packing_is_deterministic_and_supported() {
           "full-shell packing must produce a deterministic layout independent of the race area cap");
   require(a.summary.two_by_three_modules > 0 &&
           a.summary.individual_cells == a.cells.size(), "packing summary must count modules and cells");
+  require(a.cells.size() >= 114,
+          "an 11-by-11 flat deck should be densely filled with aligned modules");
   for (std::size_t i = 0; i < a.cells.size(); ++i) {
     require(a.cells[i].center.x == b.cells[i].center.x && a.cells[i].center.y == b.cells[i].center.y,
             "packing positions must be deterministic");
     require(a.cells[i].module_rows == 3 && (a.cells[i].module_columns == 1 || a.cells[i].module_columns == 2),
             "packing must retain complete module metadata");
+    require(std::min(std::abs(a.cells[i].v_axis.x), std::abs(a.cells[i].v_axis.y)) < 1.0e-5f,
+            "a rectangular deck must not use diagonal placements");
   }
 }
 
@@ -217,19 +221,29 @@ void perimeter_packing_follows_the_rounded_nose() {
   solar::CellGrid grid;
   solar::ShellRegion region;
   region.minimum = {-1,-1,0}; region.maximum = {1,1.5f,1};
-  region.use_canopy_exclusion = false;
+  region.exclusion_minimum = {-0.25f, 0.2f, 0};
+  region.exclusion_maximum = {0.25f, 1.0f, 1};
   const auto packed = solar::pack_shell_perimeter_inward(scene, mesh.bounds, scene, grid, region, {});
   require(!packed.cells.empty() && packed.cells.front().center.y > 0.8f,
           "perimeter packing should start at the broad rear end");
   bool follows_curve = false;
+  bool left_strip = false, right_strip = false;
   for (const auto& cell : packed.cells) {
     require(solar::validate_shell_cell(cell, scene, scene, grid), "contour cell must remain on the actual surface");
+    if (cell.center.y > 0.25f)
+      require(std::min(std::abs(cell.v_axis.x), std::abs(cell.v_axis.y)) < 1.0e-5f,
+              "the straight deck remains aligned even when the nose is curved");
+    if (cell.center.y > 0.25f && cell.center.y < 0.95f) {
+      left_strip |= cell.center.x < -0.3f;
+      right_strip |= cell.center.x > 0.3f;
+    }
     const solar::Vec3 radial{cell.center.x, cell.center.y, 0};
     if (cell.center.y < -0.25f && std::abs(cell.v_axis.x) > 0.2f && std::abs(cell.v_axis.y) > 0.2f &&
         std::abs(solar::dot(solar::normalized(radial), cell.v_axis)) < 0.3f)
       follows_curve = true;
   }
   require(follows_curve, "rounded nose should receive modules oriented along the local contour");
+  require(left_strip && right_strip, "the same aligned grid should fill both strips beside a canopy exclusion");
 }
 
 void track_profiles_preserve_each_sample_and_cell() {
