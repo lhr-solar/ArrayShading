@@ -931,12 +931,6 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
       }
       camera_routing.split = track_view;
       camera_routing.split_x = kPanelWidth + (io.DisplaySize.x - kPanelWidth) * 0.5;
-      if (race_progress) {
-        ImGui::SeparatorText("Race optimization");
-        draw_race_progress(*race_progress);
-        if (race_progress->stop_requested) ImGui::TextUnformatted("Stopping at the next safe point...");
-        else if (ImGui::Button("Stop optimization")) race_progress->stop_requested = true;
-      }
       if (race_result) {
         const auto& result = race_result->optimized;
         ImGui::SeparatorText(race_running ? "Previous race result" : "Race result");
@@ -1106,6 +1100,11 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
           ImGui::TextWrapped("Browse for a top-shell STL and approve its alignment to enable optimization.");
       }
       ImGui::EndDisabled();
+      if (race_progress) {
+        draw_race_progress(*race_progress);
+        if (race_progress->stop_requested) ImGui::TextUnformatted("Stopping at the next safe point...");
+        else if (ImGui::Button("Stop optimization")) race_progress->stop_requested = true;
+      }
       if (!race_status.empty()) ImGui::TextWrapped("%s", race_status.c_str());
 
       ImGui::Spacing();
