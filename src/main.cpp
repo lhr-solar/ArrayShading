@@ -2,6 +2,9 @@
 #include "solar/stl_mesh.hpp"
 #include "solar/trace_scene.hpp"
 #include "solar/viewer.hpp"
+#include "solar/optimizer.hpp"
+#include "solar/race.hpp"
+#include "solar/placement_surface.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -17,6 +20,8 @@ namespace {
 
 struct Options {
   std::filesystem::path stl_path;
+  std::filesystem::path top_shell_path;
+  solar::Transform top_correction{1.0f, {0, 0, 0}, {0, 0, 0}};
   std::filesystem::path output_path = "results/cpp-cell-irradiance.csv";
   solar::Transform transform;
   solar::Sun sun;
@@ -25,6 +30,8 @@ struct Options {
   solar::ShellRegion shell_region;
   std::size_t max_triangles = 0;
   bool headless = false;
+  bool optimize_race = false;
+  std::filesystem::path race_config_path = SOLAR_DEFAULT_RACE_CONFIG;
 };
 
 float number(const char* value, std::string_view flag) {
@@ -72,6 +79,9 @@ void usage(const char* executable) {
          "y=north, z=up.\n\n"
       << "Geometry:\n"
       << "  --stl PATH                 Binary car STL (required)\n"
+      << "  --top-shell PATH           Separate aligned top-shell STL (required for race optimization)\n"
+      << "  --top-offset-x/y/z M       Verified shell-only correction in car-world metres\n"
+      << "  --top-rotate-x/y/z DEG     Verified shell-only correction about world origin\n"
       << "  --scale N                  STL-unit to metre scale (default 1.0)\n"
       << "  --rotate-x DEG             X rotation (default 90)\n"
       << "  --rotate-y DEG             Y rotation (default 0)\n"
@@ -106,6 +116,8 @@ void usage(const char* executable) {
       << "Output:\n"
       << "  --output PATH              Per-cell CSV path\n"
       << "  --headless                 Skip the OpenGL result window\n"
+      << "  --race-config PATH         Race JSON (default config/race.json)\n"
+      << "  --optimize-race            Optimize timed track energy before viewing\n"
       << "  --help                     Show this message\n";
 }
 
@@ -125,6 +137,20 @@ Options parse_options(int argc, char** argv) {
       std::exit(0);
     } else if (flag == "--stl") {
       options.stl_path = next(index, flag);
+    } else if (flag == "--top-shell") {
+      options.top_shell_path = next(index, flag);
+    } else if (flag == "--top-offset-x") {
+      options.top_correction.translation.x = number(next(index, flag), flag);
+    } else if (flag == "--top-offset-y") {
+      options.top_correction.translation.y = number(next(index, flag), flag);
+    } else if (flag == "--top-offset-z") {
+      options.top_correction.translation.z = number(next(index, flag), flag);
+    } else if (flag == "--top-rotate-x") {
+      options.top_correction.rotation_degrees.x = number(next(index, flag), flag);
+    } else if (flag == "--top-rotate-y") {
+      options.top_correction.rotation_degrees.y = number(next(index, flag), flag);
+    } else if (flag == "--top-rotate-z") {
+      options.top_correction.rotation_degrees.z = number(next(index, flag), flag);
     } else if (flag == "--output") {
       options.output_path = next(index, flag);
     } else if (flag == "--scale") {
@@ -200,11 +226,17 @@ Options parse_options(int argc, char** argv) {
       options.max_triangles = positive_integer(next(index, flag), flag);
     } else if (flag == "--headless") {
       options.headless = true;
+    } else if (flag == "--race-config") {
+      options.race_config_path = next(index, flag);
+    } else if (flag == "--optimize-race") {
+      options.optimize_race = true;
     } else {
       throw std::runtime_error("Unknown option: " + std::string(flag));
     }
   }
   if (options.stl_path.empty()) throw std::runtime_error("--stl PATH is required");
+  if (options.optimize_race && options.top_shell_path.empty())
+    throw std::runtime_error("--optimize-race requires --top-shell PATH; full-car mask placement is not used for optimization");
   if (options.transform.scale <= 0.0f || options.sun.dni_w_m2 < 0.0f ||
       options.sun.dhi_w_m2 < 0.0f || options.grid.gap_m < 0.0f ||
       options.grid.maximum_support_plane_deviation_m < 0.0f) {
@@ -260,14 +292,30 @@ int main(int argc, char** argv) {
 
     start = Clock::now();
     std::vector<solar::Cell> candidates;
-    {
-      solar::TriangleMesh eligible_shell =
-          solar::filter_eligible_shell(mesh, options.shell_region);
+    if (options.headless || options.optimize_race) {
+      solar::TriangleMesh eligible_shell;
+      solar::ShellRegion placement_region = options.shell_region;
+      if (!options.top_shell_path.empty()) {
+        auto source = solar::load_binary_stl(options.top_shell_path, options.transform);
+        solar::transform_mesh(source, options.top_correction);
+        auto prepared = solar::prepare_placement_surface(source, scene);
+        eligible_shell = std::move(prepared.mesh);
+        placement_region = prepared.region;
+      } else {
+        eligible_shell = solar::filter_eligible_shell(mesh, options.shell_region);
+      }
       std::cout << "Eligible placement shell: "
                 << eligible_shell.triangle_count() << " triangles\n";
       solar::TraceScene placement_scene(eligible_shell);
       candidates = solar::project_cells(placement_scene, eligible_shell.bounds,
-                                        options.grid, &options.shell_region);
+                                        options.grid, &placement_region);
+      if (!options.top_shell_path.empty()) {
+        std::vector<solar::Cell> supported;
+        for (auto cell : candidates)
+          if (solar::conform_shell_cell(cell, placement_scene, scene, options.grid))
+            supported.push_back(cell);
+        candidates = std::move(supported);
+      }
     }
     std::cout << "Projected " << candidates.size()
               << " valid Maxeon Gen III candidate locations\n";
@@ -291,12 +339,39 @@ int main(int argc, char** argv) {
 
     solar::write_cell_csv(options.output_path, cells);
     std::cout << "Wrote " << options.output_path << '\n';
+    if (options.optimize_race) {
+      const auto config = solar::load_race_config(options.race_config_path);
+      const auto track = solar::load_track(config.track_path);
+      const auto race = solar::build_race_run(config, track);
+      auto top_shell = solar::load_binary_stl(options.top_shell_path, options.transform);
+      solar::transform_mesh(top_shell, options.top_correction);
+      const auto eligible = solar::prepare_placement_surface(top_shell, scene);
+      solar::TraceScene placement(eligible.mesh);
+      const auto optimized = solar::optimize_race_layout(
+          placement, eligible.mesh.bounds, scene, options.grid, eligible.region,
+          race, options.simulation, solar::optimization_settings(config));
+      cells = optimized.layout.cells;
+      layout_summary = optimized.layout.summary;
+      summary.cell_count = cells.size();
+      summary.active_area_m2 = 0;
+      for (const auto& cell : cells) summary.active_area_m2 += cell.active_area_m2;
+      summary.incident_solar_power_w = static_cast<float>(optimized.optical_energy_wh / (race.duration_seconds / 3600.0));
+      summary.area_weighted_irradiance_w_m2 = summary.active_area_m2 > 0 ? summary.incident_solar_power_w / summary.active_area_m2 : 0;
+      solar::write_cell_csv(options.output_path, cells);
+      auto report = options.output_path;
+      report.replace_extension("race.json");
+      solar::write_optimized_race(report, config, race, optimized);
+      std::cout << "Race electrical energy: " << optimized.electrical_energy_wh
+                << " Wh; " << optimized.status << "\nReport: " << report << '\n';
+    }
     if (!options.headless) {
       std::cout << "Opening OpenGL viewer...\n";
       solar::Sun interactive_sun = options.sun;
       solar::SimulationSettings interactive_settings = options.simulation;
       solar::show_viewer(mesh, scene, cells, interactive_sun,
                          interactive_settings, summary, layout_summary,
+                         options.grid, options.shell_region,
+                         {options.stl_path, options.top_shell_path, options.transform, options.top_correction}, options.race_config_path,
                          options.output_path);
     }
     return 0;

@@ -75,6 +75,16 @@ TriangleMesh load_binary_stl(const std::filesystem::path& path,
   return mesh;
 }
 
+void transform_mesh(TriangleMesh& mesh, const Transform& transform) {
+  mesh.bounds = {};
+  for (auto& vertex : mesh.vertices) {
+    vertex = transform.apply(vertex);
+    if (!std::isfinite(vertex.x) || !std::isfinite(vertex.y) || !std::isfinite(vertex.z))
+      throw std::runtime_error("Mesh transform produced nonfinite coordinates");
+    mesh.bounds.include(vertex);
+  }
+}
+
 TriangleMesh filter_eligible_shell(const TriangleMesh& source,
                                    const ShellRegion& region) {
   auto inside = [](const Vec3& point, const Vec3& minimum,
@@ -99,7 +109,7 @@ TriangleMesh filter_eligible_shell(const TriangleMesh& source,
     const Vec3& c = source.vertices[first + 2U];
     const Vec3 centroid = (a + b + c) / 3.0f;
     if (!inside(centroid, region.minimum, region.maximum)) continue;
-    if (inside(centroid, region.exclusion_minimum,
+    if (region.use_canopy_exclusion && inside(centroid, region.exclusion_minimum,
                region.exclusion_maximum))
       continue;
     result.vertices.push_back(a);

@@ -1,0 +1,16 @@
+{
+  "track_path": "../data/track/oir_centerline.csv",
+  "date": "2026-11-07",
+  "start_local": "09:00",
+  "end_local": "17:00",
+  "utc_offset_seconds": -21600,
+  "timezone": "America/Chicago",
+  "start_distance_m": 0.0,
+  "speed_mph": 47.5,
+  "max_active_area_m2": 6.0,
+  "cell_efficiency": 0.243,
+  "track_step_m": 100.0,
+  "position_step_m": 0.128,
+  "angle_step_degrees": 15.0,
+  "solver_time_limit_seconds": 60.0
+}

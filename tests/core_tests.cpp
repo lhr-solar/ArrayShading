@@ -222,6 +222,32 @@ int main() {
               curved_generated.cells.size() == 9,
           "curved-shell cell groups are not treated as rigid flat plates");
 
+  // The geographic horizon is not car-local Z on an inclined road.
+  test_cells[0] = test_cell;
+  test_cells[0].center = {3, 0, 0.5f};
+  test_sun.direction_to_sun = solar::normalized({0, -0.9f, 0.1f});
+  test_sun.world_up = solar::normalized({0, 0.8f, 0.6f});
+  test_sun.dni_w_m2 = 900;
+  solar::simulate_cells(test_cells, shade_scene, test_sun, test_settings);
+  require(close(test_cells[0].direct_w_m2, 0),
+          "sun below geographic horizon cannot illuminate inclined car");
+
+  // An unobstructed horizontal receiver gets exactly DHI from the isotropic
+  // cosine-weighted estimator. A 60-degree receiver sees 75% of the sky.
+  test_cells[0] = test_cell;
+  test_cells[0].center = {0, 0, 5};
+  test_sun = {};
+  test_sun.dni_w_m2 = 0;
+  test_sun.dhi_w_m2 = 110;
+  test_settings.hemisphere_samples = 4096;
+  solar::simulate_cells(test_cells, flat_scene, test_sun, test_settings);
+  require(close(test_cells[0].diffuse_sky_w_m2, 110, 0.01f),
+          "unobstructed horizontal sky irradiance equals DHI");
+  test_cells[0].normal = solar::normalized({0.8660254f, 0, 0.5f});
+  solar::simulate_cells(test_cells, flat_scene, test_sun, test_settings);
+  require(close(test_cells[0].diffuse_sky_w_m2, 82.5f, 1.0f),
+          "tilted isotropic sky estimator matches analytical sky view factor");
+
   if (failures != 0) {
     std::cerr << failures << " test assertion(s) failed\n";
     return 1;

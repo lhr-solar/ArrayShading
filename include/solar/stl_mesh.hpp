@@ -24,6 +24,7 @@ struct ShellRegion {
   Vec3 exclusion_minimum{-0.32f, -1.45f, 0.00f};
   Vec3 exclusion_maximum{0.32f, 1.35f, 1.40f};
   float minimum_upward_normal_z = 0.75f;
+  bool use_canopy_exclusion = true;
 };
 
 TriangleMesh load_binary_stl(const std::filesystem::path& path,
@@ -32,5 +33,6 @@ TriangleMesh load_binary_stl(const std::filesystem::path& path,
 
 TriangleMesh filter_eligible_shell(const TriangleMesh& source,
                                    const ShellRegion& region);
+void transform_mesh(TriangleMesh& mesh, const Transform& transform);
 
 }  // namespace solar

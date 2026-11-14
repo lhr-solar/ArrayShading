@@ -7,6 +7,7 @@
     "glew",
     "glfw3",
     "glm",
+    "highs",
     {
       "name": "imgui",
       "features": [

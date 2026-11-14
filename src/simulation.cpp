@@ -103,7 +103,7 @@ class Integrator {
     const Vec3 center_origin =
         cell.center + cell.normal * settings_.ray_epsilon_m;
     const float cosine = std::max(0.0f, dot(cell.normal, sun_.direction_to_sun));
-    if (cosine > 0.0f) {
+    if (cosine > 0.0f && dot(sun_.direction_to_sun, sun_.world_up) > 0.0f) {
       const std::uint32_t axis_samples =
           std::clamp(settings_.direct_samples_per_axis, 1U, 64U);
       std::uint32_t visible_samples = 0;
@@ -138,7 +138,7 @@ class Integrator {
       const auto hit = scene_.intersect(center_origin, direction,
                                         settings_.ray_epsilon_m);
       if (!hit) {
-        if (direction.z > 0.0f) sky_sum += sun_.dhi_w_m2 / kPi;
+        if (dot(direction, sun_.world_up) > 0.0f) sky_sum += sun_.dhi_w_m2 / kPi;
       } else {
         reflected_sum += shade_hit(direction, *hit, 0);
       }
@@ -153,7 +153,7 @@ class Integrator {
                        std::uint32_t depth) const {
     const auto hit = scene_.intersect(origin, direction,
                                       settings_.ray_epsilon_m);
-    if (!hit) return direction.z > 0.0f ? sun_.dhi_w_m2 / kPi : 0.0f;
+    if (!hit) return dot(direction, sun_.world_up) > 0.0f ? sun_.dhi_w_m2 / kPi : 0.0f;
     return shade_hit(direction, *hit, depth);
   }
 
@@ -162,7 +162,7 @@ class Integrator {
     const float sun_cosine =
         std::max(0.0f, dot(hit.normal, sun_.direction_to_sun));
     float direct_incident = 0.0f;
-    if (sun_cosine > 0.0f &&
+    if (sun_cosine > 0.0f && dot(sun_.direction_to_sun, sun_.world_up) > 0.0f &&
         scene_.visible(hit.point + hit.normal * settings_.ray_epsilon_m,
                        sun_.direction_to_sun,
                        settings_.ray_epsilon_m)) {
@@ -170,7 +170,7 @@ class Integrator {
     }
 
     const float sky_view_factor =
-        std::clamp((1.0f + hit.normal.z) * 0.5f, 0.0f, 1.0f);
+        std::clamp((1.0f + dot(hit.normal, sun_.world_up)) * 0.5f, 0.0f, 1.0f);
     const float local_incident =
         direct_incident + sun_.dhi_w_m2 * sky_view_factor;
     const float diffuse = hit.material.reflectance *
@@ -236,8 +236,8 @@ std::vector<Cell> project_cells(const TraceScene& scene, const Bounds& bounds,
       if (eligible_region &&
           (!inside(hit->point, eligible_region->minimum,
                    eligible_region->maximum) ||
-           inside(hit->point, eligible_region->exclusion_minimum,
-                  eligible_region->exclusion_maximum)))
+           (eligible_region->use_canopy_exclusion && inside(hit->point, eligible_region->exclusion_minimum,
+                  eligible_region->exclusion_maximum))))
         continue;
       const float minimum_normal =
           eligible_region
@@ -263,8 +263,8 @@ std::vector<Cell> project_cells(const TraceScene& scene, const Bounds& bounds,
               (eligible_region &&
                (!inside(support->point, eligible_region->minimum,
                         eligible_region->maximum) ||
-                inside(support->point, eligible_region->exclusion_minimum,
-                       eligible_region->exclusion_maximum)))) {
+                (eligible_region->use_canopy_exclusion && inside(support->point, eligible_region->exclusion_minimum,
+                       eligible_region->exclusion_maximum))))) {
             fully_supported = false;
             break;
           }
@@ -281,7 +281,10 @@ std::vector<Cell> project_cells(const TraceScene& scene, const Bounds& bounds,
       normal = normalized(normal);
       if (normal.z < 0.0f) normal = -normal;
       if (normal.z < minimum_normal) continue;
+      float outward_deviation = 0.0f;
       for (const Hit& support : supports) {
+        outward_deviation = std::max(outward_deviation,
+                                     dot(support.point - hit->point, normal));
         const float plane_deviation =
             std::abs(dot(support.point - hit->point, normal));
         if (support.normal.z < minimum_normal ||
@@ -296,7 +299,7 @@ std::vector<Cell> project_cells(const TraceScene& scene, const Bounds& bounds,
       const auto [u, v] = tangent_axes(normal);
       cells.push_back({row,
                        column,
-                       hit->point + normal * grid.surface_offset_m,
+                       hit->point + normal * (outward_deviation + grid.surface_offset_m),
                        normal,
                        u,
                        v,
@@ -450,6 +453,8 @@ void write_cell_csv(const std::filesystem::path& path,
            << cell.active_area_m2 << ','
            << cell.total_w_m2() * cell.active_area_m2 << '\n';
   }
+  output.flush();
+  if (!output) throw std::runtime_error("Failed writing CSV: " + path.string());
 }
 
 }  // namespace solar

@@ -13,6 +13,8 @@ struct Sun {
   Vec3 direction_to_sun = normalized({0.25f, -0.18f, 0.951f});
   float dni_w_m2 = 850.0f;
   float dhi_w_m2 = 110.0f;
+  // Geographic vertical expressed in the car frame (changes on track grades).
+  Vec3 world_up{0.0f, 0.0f, 1.0f};
 };
 
 struct SimulationSettings {

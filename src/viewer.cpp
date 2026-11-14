@@ -1,5 +1,8 @@
 #include "solar/viewer.hpp"
 #include "solar/weather.hpp"
+#include "solar/optimizer.hpp"
+#include "solar/race.hpp"
+#include "solar/placement_surface.hpp"
 
 #include <GL/glew.h>
 #define GLFW_INCLUDE_NONE
@@ -16,7 +19,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <future>
+#include <memory>
 #include <iomanip>
 #include <iostream>
 #include <optional>
@@ -24,6 +29,10 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#include <commdlg.h>
+#endif
 
 namespace solar {
 namespace {
@@ -113,6 +122,43 @@ struct Camera {
     pitch = 0.55f;
   }
 };
+
+struct CameraRouting {
+  Camera* car = nullptr;
+  Camera* track = nullptr;
+  Camera* dragging = nullptr;
+  bool split = false;
+  double split_x = 0;
+};
+
+struct LoadedTopShell {
+  PlacementSurface surface;
+  TraceScene scene;
+  std::filesystem::path path;
+  LoadedTopShell(PlacementSurface prepared, std::filesystem::path file)
+      : surface(std::move(prepared)), scene(surface.mesh), path(std::move(file)) {}
+};
+
+#ifdef _WIN32
+std::string browse_stl() {
+  wchar_t file[32768]{};
+  OPENFILENAMEW dialog{};
+  dialog.lStructSize = sizeof(dialog);
+  dialog.hwndOwner = GetActiveWindow();
+  dialog.lpstrFilter = L"STL files\0*.stl\0All files\0*.*\0";
+  dialog.lpstrFile = file;
+  dialog.nMaxFile = static_cast<DWORD>(std::size(file));
+  dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+  dialog.lpstrTitle = L"Select the assembly-aligned top-shell STL";
+  if (!GetOpenFileNameW(&dialog)) return {};
+  const int length = WideCharToMultiByte(CP_UTF8, 0, file, -1, nullptr, 0, nullptr, nullptr);
+  if (length <= 1) return {};
+  std::string result(static_cast<std::size_t>(length), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, file, -1, result.data(), length, nullptr, nullptr);
+  result.pop_back();
+  return result;
+}
+#endif
 
 struct Breakdown {
   float direct = 0.0f;
@@ -254,7 +300,8 @@ bool imgui_captures_mouse() {
 }
 
 void cursor_callback(GLFWwindow* window, double x, double y) {
-  auto* camera = static_cast<Camera*>(glfwGetWindowUserPointer(window));
+  auto* routing = static_cast<CameraRouting*>(glfwGetWindowUserPointer(window));
+  auto* camera = routing ? routing->dragging : nullptr;
   if (!camera || !camera->dragging || imgui_captures_mouse()) return;
   const double dx = x - camera->last_x;
   const double dy = y - camera->last_y;
@@ -267,19 +314,27 @@ void cursor_callback(GLFWwindow* window, double x, double y) {
 
 void mouse_callback(GLFWwindow* window, int button, int action, int) {
   if (button != GLFW_MOUSE_BUTTON_LEFT) return;
-  auto* camera = static_cast<Camera*>(glfwGetWindowUserPointer(window));
-  if (!camera) return;
+  auto* routing = static_cast<CameraRouting*>(glfwGetWindowUserPointer(window));
+  if (!routing) return;
   if (action == GLFW_RELEASE) {
-    camera->dragging = false;
+    if (routing->dragging) routing->dragging->dragging = false;
+    routing->dragging = nullptr;
     return;
   }
   if (imgui_captures_mouse()) return;
+  double x = 0, y = 0;
+  glfwGetCursorPos(window, &x, &y);
+  auto* camera = routing->split && x < routing->split_x ? routing->track : routing->car;
+  routing->dragging = camera;
   camera->dragging = true;
   glfwGetCursorPos(window, &camera->last_x, &camera->last_y);
 }
 
 void scroll_callback(GLFWwindow* window, double, double y_offset) {
-  auto* camera = static_cast<Camera*>(glfwGetWindowUserPointer(window));
+  auto* routing = static_cast<CameraRouting*>(glfwGetWindowUserPointer(window));
+  if (!routing) return;
+  double x = 0, y = 0; glfwGetCursorPos(window, &x, &y);
+  auto* camera = routing->split && x < routing->split_x ? routing->track : routing->car;
   if (!camera || imgui_captures_mouse()) return;
   const float steps =
       std::clamp(static_cast<float>(y_offset), -2.0f, 2.0f);
@@ -396,7 +451,10 @@ float wrapped_degrees(float value) {
 void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
                  std::vector<Cell>& cells, Sun& sun,
                  SimulationSettings& settings, SimulationSummary& summary,
-                 const LayoutSummary& layout_summary,
+                 LayoutSummary& layout_summary,
+                 const CellGrid& grid, const ShellRegion& region,
+                 const ViewerGeometryInputs& geometry_inputs,
+                 const std::filesystem::path& race_config_path,
                  const std::filesystem::path& output_path) {
   glfwSetErrorCallback(glfw_error);
   if (!glfwInit()) throw std::runtime_error("GLFW initialization failed");
@@ -429,8 +487,12 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
   GLuint outlines_vao = 0, outlines_vbo = 0;
   GLuint grid_vao = 0, grid_vbo = 0;
   GLuint sun_vao = 0, sun_vbo = 0;
+  GLuint track_vao = 0, track_vbo = 0;
+  GLuint top_vao = 0, top_vbo = 0;
   GLuint program = 0;
   bool imgui_initialized = false;
+  bool imgui_context_created = false;
+  bool imgui_glfw_initialized = false;
 
   try {
     program = make_program();
@@ -478,24 +540,38 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
     glBufferData(GL_ARRAY_BUFFER, sizeof(rendered_sun), rendered_sun.data(),
                  GL_DYNAMIC_DRAW);
 
+    glGenVertexArrays(1, &track_vao);
+    glGenBuffers(1, &track_vbo);
+    configure_render_vao(track_vao, track_vbo);
+    glGenVertexArrays(1, &top_vao);
+    glGenBuffers(1, &top_vbo);
+    configure_render_vao(top_vao, top_vbo);
+
     Camera camera;
     camera.target = mesh.bounds.center();
     camera.home_distance =
         1.65f * std::max({mesh.bounds.extent().x, mesh.bounds.extent().y,
                           mesh.bounds.extent().z});
     camera.reset();
-    glfwSetWindowUserPointer(window, &camera);
+    Camera track_camera = camera;
+    bool track_view = false;
+    bool select_layout_tab = false;
+    CameraRouting camera_routing{&camera, &track_camera};
+    glfwSetWindowUserPointer(window, &camera_routing);
     glfwSetCursorPosCallback(window, cursor_callback);
     glfwSetMouseButtonCallback(window, mouse_callback);
     glfwSetScrollCallback(window, scroll_callback);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    imgui_context_created = true;
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     set_gui_theme();
-    if (!ImGui_ImplGlfw_InitForOpenGL(window, true) ||
-        !ImGui_ImplOpenGL3_Init("#version 330"))
+    if (!ImGui_ImplGlfw_InitForOpenGL(window, true))
+      throw std::runtime_error("Dear ImGui GLFW backend initialization failed");
+    imgui_glfw_initialized = true;
+    if (!ImGui_ImplOpenGL3_Init("#version 330"))
       throw std::runtime_error("Dear ImGui backend initialization failed");
     imgui_initialized = true;
 
@@ -531,9 +607,109 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
     std::future<WeatherConditions> weather_future;
     bool weather_request_running = false;
     std::string weather_status = "Enter coordinates, then fetch current conditions";
+    struct RaceJob { OptimizedLayout optimized; RaceRun race; RaceConfig config; };
+    std::future<RaceJob> race_future;
+    bool race_running = false;
+    bool race_average = false;
+    std::optional<RaceJob> race_result;
+    std::optional<RaceConfig> race_config;
+    std::string race_status;
+    char top_shell_path[4096]{};
+    std::shared_ptr<LoadedTopShell> loaded_top;
+    std::shared_ptr<LoadedTopShell> pending_top;
+    Transform top_correction = geometry_inputs.top_correction;
+    std::vector<RenderVertex> rendered_top;
+    std::string top_status = "Load the separate top-shell STL before optimizing";
+    const auto load_top_shell = [&] {
+      loaded_top.reset();
+      pending_top.reset();
+      rendered_top.clear();
+      race_result.reset();
+      cells.clear(); summary = {}; layout_summary = {};
+      rendered_cells.clear(); rendered_outlines.clear();
+      upload_vertices(cells_vbo, rendered_cells);
+      upload_vertices(outlines_vbo, rendered_outlines);
+      breakdown = {};
+      race_average = false;
+      try {
+        const auto path = std::filesystem::u8path(top_shell_path);
+        auto source = load_binary_stl(path, geometry_inputs.transform);
+        transform_mesh(source, top_correction);
+        for (const auto& point : source.vertices)
+          rendered_top.push_back({point, {0.85f, 0.42f, 0.10f}});
+        upload_vertices(top_vbo, rendered_top, GL_STATIC_DRAW);
+        camera.target = source.bounds.center();
+        camera.home_distance = 1.65f * std::max({source.bounds.extent().x, source.bounds.extent().y, source.bounds.extent().z});
+        camera.reset();
+        auto prepared = prepare_placement_surface(source, scene,
+            {.alignment_tolerance_m = 0.005f,
+             .minimum_upward_normal_z = region.minimum_upward_normal_z});
+        pending_top = std::make_shared<LoadedTopShell>(std::move(prepared), path);
+        top_status = "Alignment checks passed. Inspect the orange overlay, then approve to enable optimization.";
+      } catch (const std::exception& error) { top_status = error.what(); }
+    };
+    if (!geometry_inputs.top_shell_path.empty()) {
+      const auto text = geometry_inputs.top_shell_path.u8string();
+      if (text.size() < sizeof(top_shell_path)) {
+        std::memcpy(top_shell_path, text.c_str(), text.size() + 1);
+        load_top_shell();
+      } else top_status = "Top-shell path is too long";
+    }
+    std::vector<RenderVertex> rendered_track;
+    double track_length_m = 0;
+    float track_relief_m = 0;
+    std::string track_status;
+    const auto load_track_view = [&] {
+      rendered_track.clear();
+      track_length_m = 0;
+      track_relief_m = 0;
+      track_status.clear();
+      try {
+        const auto track = load_track(race_config->track_path);
+        const auto points = track_centerline_vertices(track);
+        Bounds bounds;
+        for (const auto& point : points) {
+          bounds.include(point);
+          rendered_track.push_back({point, {0.10f, 0.78f, 0.96f}});
+        }
+        track_length_m = track.surface_length_m;
+        track_relief_m = bounds.extent().z;
+        track_camera.target = bounds.center();
+        track_camera.home_distance = 1.65f * std::max({bounds.extent().x, bounds.extent().y, bounds.extent().z, 1.0f});
+        track_camera.reset();
+        upload_vertices(track_vbo, rendered_track, GL_STATIC_DRAW);
+      } catch (const std::exception& error) { track_status = error.what(); }
+    };
+    try { race_config = load_race_config(race_config_path); load_track_view(); }
+    catch (const std::exception& error) { race_status = error.what(); }
 
     while (!glfwWindowShouldClose(window)) {
       glfwPollEvents();
+      if (race_running && race_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        try {
+          race_result = race_future.get();
+          cells = race_result->optimized.layout.cells;
+          layout_summary = race_result->optimized.layout.summary;
+          summary = {};
+          summary.cell_count = cells.size();
+          for (const auto& cell : cells) summary.active_area_m2 += cell.active_area_m2;
+          summary.incident_solar_power_w = static_cast<float>(race_result->optimized.optical_energy_wh / (race_result->race.duration_seconds / 3600.0));
+          if (summary.active_area_m2 > 0) summary.area_weighted_irradiance_w_m2 = summary.incident_solar_power_w / summary.active_area_m2;
+          breakdown = calculate_breakdown(cells);
+          rendered_cells = cell_vertices(cells);
+          rendered_outlines = cell_outlines(cells);
+          upload_vertices(cells_vbo, rendered_cells);
+          upload_vertices(outlines_vbo, rendered_outlines);
+          race_average = true;
+          inputs_dirty = false;
+          status = "Race-average cell irradiance";
+          write_cell_csv(output_path, cells);
+          auto report = output_path; report.replace_extension("race.json");
+          write_optimized_race(report, race_result->config, race_result->race, race_result->optimized);
+          race_status = race_result->optimized.status;
+        } catch (const std::exception& error) { race_status = error.what(); }
+        race_running = false;
+      }
       if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
         glfwSetWindowShouldClose(window, GLFW_TRUE);
 
@@ -573,7 +749,69 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       ImGui::TextDisabled("FULL-MESH STUDIO");
       ImGui::Text("Solar array irradiance");
       ImGui::TextDisabled("Embree physics + OpenGL visualization");
+      if (ImGui::BeginTabBar("Simulator views")) {
+        if (ImGui::BeginTabItem("Car / array")) { track_view = false; ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Track + layout", nullptr,
+            select_layout_tab ? ImGuiTabItemFlags_SetSelected : 0)) {
+          track_view = true; ImGui::EndTabItem();
+        }
+        select_layout_tab = false;
+        ImGui::EndTabBar();
+      }
+      camera_routing.split = track_view;
+      camera_routing.split_x = kPanelWidth + (io.DisplaySize.x - kPanelWidth) * 0.5;
+      if (track_view) {
+        ImGui::Text("Track: %.2f km | %zu vertices", track_length_m / 1000.0, rendered_track.size());
+        ImGui::Text("Elevation range: %.1f m (true scale)", track_relief_m);
+        ImGui::TextWrapped("Left: track centerline. Right: actual top shell, full-car overlay and selected cells. Orbit/zoom each pane independently.");
+        if (!track_status.empty()) ImGui::TextWrapped("Track error: %s", track_status.c_str());
+      }
       ImGui::Spacing();
+
+      ImGui::TextDisabled("LOCAL GEOMETRY FILES");
+      ImGui::TextWrapped("Full car: %s", geometry_inputs.car_path.string().c_str());
+      ImGui::BeginDisabled(race_running);
+      ImGui::SetNextItemWidth(-1.0f);
+      bool correction_changed = ImGui::InputText("##top-shell-path", top_shell_path, sizeof(top_shell_path));
+      ImGui::TextDisabled("Optional VERIFIED correction, after the common STL transform");
+      correction_changed |= ImGui::InputFloat3("Shell offset (m)", &top_correction.translation.x, "%.4f");
+      correction_changed |= ImGui::InputFloat3("Shell XYZ rotation (deg)", &top_correction.rotation_degrees.x, "%.3f");
+      if (correction_changed) {
+        loaded_top.reset(); pending_top.reset();
+        cells.clear(); summary = {}; layout_summary = {}; race_result.reset(); breakdown = {};
+        rendered_cells.clear(); rendered_outlines.clear(); rendered_top.clear();
+        upload_vertices(cells_vbo, rendered_cells); upload_vertices(outlines_vbo, rendered_outlines);
+        top_status = "File or correction changed; reload to validate. No automatic registration is applied.";
+      }
+#ifdef _WIN32
+      if (ImGui::Button("Browse top-shell STL")) {
+        const auto selected = browse_stl();
+        if (!selected.empty() && selected.size() < sizeof(top_shell_path)) {
+          std::memcpy(top_shell_path, selected.c_str(), selected.size() + 1);
+          load_top_shell();
+        }
+      }
+      ImGui::SameLine();
+#endif
+      if (ImGui::Button("Load top shell")) load_top_shell();
+      ImGui::EndDisabled();
+      ImGui::TextWrapped("%s", top_status.c_str());
+      const auto checked_top = loaded_top ? loaded_top : pending_top;
+      if (checked_top) {
+        ImGui::TextWrapped("Validated file: %s", checked_top->path.string().c_str());
+        ImGui::Text("Matched probes: %zu/%zu, max matched error %.2f mm",
+            checked_top->surface.matched_samples, checked_top->surface.checked_samples,
+            checked_top->surface.max_alignment_error_m * 1000.0);
+        ImGui::TextWrapped("Unmatched shell regions are excluded from placement.");
+      }
+      if (pending_top && !loaded_top && !race_running && ImGui::Button("Approve validated shell alignment")) {
+        loaded_top = pending_top;
+        rendered_top.clear();
+        for (const auto& point : loaded_top->surface.mesh.vertices)
+          rendered_top.push_back({point, {0.24f, 0.46f, 0.54f}});
+        upload_vertices(top_vbo, rendered_top, GL_STATIC_DRAW);
+        top_status = "Approved shell loaded. Cells will be generated only on this matched surface.";
+      }
 
       ImGui::BeginChild("Summary", {0.0f, 188.0f}, true);
       ImGui::TextDisabled("CURRENT RESULT");
@@ -590,6 +828,63 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
                        std::to_string(layout_summary.one_by_three_modules));
       draw_label_value("Active area", fixed(summary.active_area_m2, 3) + " m2");
       ImGui::EndChild();
+
+      ImGui::TextDisabled("TIMED TRACK LAYOUT OPTIMIZER");
+      ImGui::TextWrapped("Config: %s", race_config_path.string().c_str());
+      ImGui::BeginDisabled(race_running);
+      if (ImGui::Button("Reload race config")) {
+        try { race_config = load_race_config(race_config_path); race_status.clear(); load_track_view(); }
+        catch (const std::exception& error) { race_config.reset(); race_status = error.what(); }
+      }
+      if (race_config) {
+        ImGui::Text("%s  %s-%s %s", race_config->date.c_str(), race_config->start_local.c_str(), race_config->end_local.c_str(), race_config->timezone.c_str());
+        ImGui::Text("Speed %.1f mph | efficiency %.1f%%", race_config->speed_mph, race_config->cell_efficiency * 100.0);
+        ImGui::InputDouble("Max active area (m2)", &race_config->max_active_area_m2, 0.1, 1.0, "%.3f");
+        ImGui::InputDouble("Position step (m)", &race_config->position_step_m, 0, 0, "%.3f");
+        ImGui::InputDouble("Angle step (deg)", &race_config->angle_step_degrees, 0, 0, "%.1f");
+        ImGui::InputDouble("Track step (m)", &race_config->track_step_m, 0, 0, "%.1f");
+        ImGui::InputDouble("Packing solver limit (s)", &race_config->solver_time_limit_seconds, 0, 0, "%.0f");
+        ImGui::InputDouble("Start offset on track (m)", &race_config->start_distance_m, 0, 0, "%.1f");
+        if (ImGui::Button("Save race config")) {
+          try { save_race_config(race_config_path, *race_config); race_status = "Race config saved"; }
+          catch (const std::exception& error) { race_status = error.what(); }
+        }
+        ImGui::TextWrapped("Start offset 0 uses the supplied track origin; physical start/finish is not verified in the archive.");
+        ImGui::BeginDisabled(!loaded_top);
+        if (ImGui::Button("OPTIMIZE RACE LAYOUT", {-1.0f, 36.0f})) {
+          const auto config = *race_config;
+          const auto trace_settings = settings;
+          const auto top_snapshot = loaded_top;
+          race_future = std::async(std::launch::async, [&, config, trace_settings, top_snapshot] {
+            RaceJob job;
+            job.config = config;
+            const auto track = load_track(config.track_path);
+            job.race = build_race_run(config, track);
+            job.optimized = optimize_race_layout(top_snapshot->scene,
+                top_snapshot->surface.mesh.bounds, scene, grid,
+                top_snapshot->surface.region, job.race, trace_settings, optimization_settings(config));
+            return job;
+          });
+          race_running = true;
+          track_view = true;
+          select_layout_tab = true;
+          race_status = "Fetching dated weather, scoring candidates, then packing. Scoring can be lengthy; the solver time limit applies only to packing.";
+        }
+        ImGui::EndDisabled();
+      }
+      ImGui::EndDisabled();
+      ImGui::TextWrapped("%s", race_status.c_str());
+      if (race_result) {
+        const auto& result = race_result->optimized;
+        ImGui::Text("Electrical energy: %.1f Wh", result.electrical_energy_wh);
+        ImGui::Text("Optical energy: %.1f Wh", result.optical_energy_wh);
+        ImGui::Text("Average electrical power: %.1f W", result.mean_electrical_power_w);
+        ImGui::Text("%.2f laps | %zu time/track samples", race_result->race.laps, race_result->race.samples.size());
+        ImGui::Text("Candidate modules: %zu", result.candidate_modules);
+        if (result.relative_gap >= 0) ImGui::Text("Energy bound gap: %.2f%%", result.relative_gap * 100.0);
+        else ImGui::TextUnformatted("Energy bound gap: unavailable");
+        ImGui::TextWrapped("Finite-candidate solution only; not a continuous global optimum. Cell colors: %s.", race_average ? "race average" : "instantaneous rerun");
+      }
 
       ImGui::Spacing();
       ImGui::TextDisabled("OPEN-METEO LOCATION");
@@ -674,6 +969,7 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       else
         ImGui::TextColored({0.35f, 0.80f, 0.55f, 1.0f}, "%s", status.c_str());
 
+      ImGui::BeginDisabled(race_running);
       if (ImGui::Button("RUN SIMULATION", {-1.0f, 42.0f})) {
         const auto start = std::chrono::steady_clock::now();
         summary = simulate_cells(cells, scene, sun, settings);
@@ -688,7 +984,9 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
                                    .count();
         status = "Completed in " + fixed(static_cast<float>(seconds), 2) + " s";
         inputs_dirty = false;
+        race_average = false;
       }
+      ImGui::EndDisabled();
       if (ImGui::Button("Export current CSV", {-1.0f, 0.0f})) {
         write_cell_csv(output_path, cells);
         status = "CSV exported";
@@ -719,6 +1017,8 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       ImGui::SameLine(220.0f);
       ImGui::Checkbox("Wireframe", &wireframe);
       ImGui::Checkbox("Live shell heat", &show_shell_heat);
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Orientation-only preview; no shadow or reflection rays. Cell irradiance fill shows traced results.");
       ImGui::Checkbox("Generated layout", &show_cells);
       ImGui::SameLine(180.0f);
       ImGui::Checkbox("Sun direction", &show_sun);
@@ -729,12 +1029,13 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
         ImGui::TextColored({1.00f, 0.55f, 0.12f, 1.0f}, "1x3 outline");
       }
       if (ImGui::Button("Reset camera", {-1.0f, 0.0f})) camera.reset();
+      if (track_view && ImGui::Button("Reset track camera", {-1.0f, 0.0f})) track_camera.reset();
 
       ImGui::Spacing();
       ImGui::Separator();
       ImGui::TextDisabled("%zu triangles  |  drag to orbit  |  wheel to zoom",
                           mesh.triangle_count());
-      ImGui::TextDisabled("Optical irradiance only - no electrical model");
+      ImGui::TextDisabled("Electrical estimate: constant efficiency, no MPPT/string losses");
       ImGui::End();
 
       int framebuffer_width = 1, framebuffer_height = 1;
@@ -746,11 +1047,14 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       const int viewport_x =
           std::min(framebuffer_width - 1, static_cast<int>(kPanelWidth * pixel_scale));
       const int viewport_width = std::max(1, framebuffer_width - viewport_x);
+      const int track_pane_width = track_view ? std::max(1, viewport_width / 2) : 0;
+      const int car_pane_x = viewport_x + track_pane_width;
+      const int car_pane_width = std::max(1, viewport_width - track_pane_width);
 
       glViewport(0, 0, framebuffer_width, framebuffer_height);
       glClearColor(0.012f, 0.023f, 0.036f, 1.0f);
       glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-      glViewport(viewport_x, 0, viewport_width, framebuffer_height);
+      glViewport(car_pane_x, 0, car_pane_width, framebuffer_height);
 
       const float cp = std::cos(camera.pitch);
       const glm::vec3 eye = as_glm(camera.target) +
@@ -761,21 +1065,23 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       const glm::mat4 view = glm::lookAt(
           eye, as_glm(camera.target), glm::vec3(0.0f, 0.0f, 1.0f));
       const glm::mat4 projection = glm::perspective(
-          glm::radians(43.0f), static_cast<float>(viewport_width) /
+          glm::radians(43.0f), static_cast<float>(car_pane_width) /
                                   static_cast<float>(std::max(1, framebuffer_height)),
-          0.01f, 250.0f);
+          std::max(0.01f, camera.home_distance * 0.0001f),
+          std::max(250.0f, camera.home_distance * 20.0f));
       const glm::mat4 vp = projection * view;
 
       hovered_shell_irradiance.reset();
       double cursor_x = 0.0, cursor_y = 0.0;
       glfwGetCursorPos(window, &cursor_x, &cursor_y);
       const double viewport_window_width =
-          static_cast<double>(window_width) - kPanelWidth;
-      if (!io.WantCaptureMouse && cursor_x >= kPanelWidth &&
+          (static_cast<double>(window_width) - kPanelWidth) * (track_view ? 0.5 : 1.0);
+      const double car_window_x = kPanelWidth + (track_view ? viewport_window_width : 0.0);
+      if (!io.WantCaptureMouse && cursor_x >= car_window_x &&
           cursor_x < window_width && cursor_y >= 0.0 &&
           cursor_y < window_height && viewport_window_width > 1.0) {
         const float ndc_x = static_cast<float>(
-            2.0 * (cursor_x - kPanelWidth) / viewport_window_width - 1.0);
+            2.0 * (cursor_x - car_window_x) / viewport_window_width - 1.0);
         const float ndc_y =
             static_cast<float>(1.0 - 2.0 * cursor_y / window_height);
         const glm::mat4 inverse_vp = glm::inverse(vp);
@@ -813,6 +1119,25 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       glUniform1i(glGetUniformLocation(program, "uUnlit"), GL_TRUE);
       glUniform1i(glGetUniformLocation(program, "uCellPass"), GL_FALSE);
       glUniform1i(glGetUniformLocation(program, "uShellHeat"), GL_FALSE);
+      if (track_view && !rendered_track.empty()) {
+        glViewport(viewport_x, 0, track_pane_width, framebuffer_height);
+        const float cp_track = std::cos(track_camera.pitch);
+        const auto eye_track = as_glm(track_camera.target) + track_camera.distance * glm::vec3(
+            cp_track * std::cos(track_camera.yaw), cp_track * std::sin(track_camera.yaw), std::sin(track_camera.pitch));
+        const auto track_vp = glm::perspective(glm::radians(43.0f),
+            static_cast<float>(track_pane_width) / std::max(1, framebuffer_height),
+            std::max(0.01f, track_camera.home_distance * 0.0001f),
+            std::max(250.0f, track_camera.home_distance * 20.0f)) *
+            glm::lookAt(eye_track, as_glm(track_camera.target), glm::vec3(0, 0, 1));
+        glUniformMatrix4fv(glGetUniformLocation(program, "uViewProjection"), 1,
+                           GL_FALSE, glm::value_ptr(track_vp));
+        glBindVertexArray(track_vao);
+        glLineWidth(2.0f);
+        glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(rendered_track.size()));
+        glViewport(car_pane_x, 0, car_pane_width, framebuffer_height);
+        glUniformMatrix4fv(glGetUniformLocation(program, "uViewProjection"), 1,
+                           GL_FALSE, glm::value_ptr(vp));
+      }
       if (show_grid) {
         glBindVertexArray(grid_vao);
         glLineWidth(1.0f);
@@ -829,6 +1154,17 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
         glDrawArrays(GL_TRIANGLES, 0,
                      static_cast<GLsizei>(mesh.vertices.size()));
         if (wireframe) glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+      }
+
+      if (!rendered_top.empty()) {
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(-1.0f, -1.0f);
+        glUniform1i(glGetUniformLocation(program, "uUnlit"), GL_FALSE);
+        glUniform1i(glGetUniformLocation(program, "uShellHeat"), GL_FALSE);
+        glUniform1i(glGetUniformLocation(program, "uCellPass"), GL_FALSE);
+        glBindVertexArray(top_vao);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(rendered_top.size()));
+        glDisable(GL_POLYGON_OFFSET_FILL);
       }
 
       if (show_cells) {
@@ -868,13 +1204,13 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
   } catch (...) {
     if (imgui_initialized) {
       ImGui_ImplOpenGL3_Shutdown();
-      ImGui_ImplGlfw_Shutdown();
-      ImGui::DestroyContext();
     }
+    if (imgui_glfw_initialized) ImGui_ImplGlfw_Shutdown();
+    if (imgui_context_created) ImGui::DestroyContext();
     if (program) glDeleteProgram(program);
-    for (GLuint buffer : {shell_vbo, cells_vbo, outlines_vbo, grid_vbo, sun_vbo})
+    for (GLuint buffer : {shell_vbo, cells_vbo, outlines_vbo, grid_vbo, sun_vbo, track_vbo, top_vbo})
       if (buffer) glDeleteBuffers(1, &buffer);
-    for (GLuint array : {shell_vao, cells_vao, outlines_vao, grid_vao, sun_vao})
+    for (GLuint array : {shell_vao, cells_vao, outlines_vao, grid_vao, sun_vao, track_vao, top_vao})
       if (array) glDeleteVertexArrays(1, &array);
     glfwDestroyWindow(window);
     glfwTerminate();
@@ -885,9 +1221,9 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
   ImGui_ImplGlfw_Shutdown();
   ImGui::DestroyContext();
   glDeleteProgram(program);
-  for (GLuint buffer : {shell_vbo, cells_vbo, outlines_vbo, grid_vbo, sun_vbo})
+  for (GLuint buffer : {shell_vbo, cells_vbo, outlines_vbo, grid_vbo, sun_vbo, track_vbo, top_vbo})
     glDeleteBuffers(1, &buffer);
-  for (GLuint array : {shell_vao, cells_vao, outlines_vao, grid_vao, sun_vao})
+  for (GLuint array : {shell_vao, cells_vao, outlines_vao, grid_vao, sun_vao, track_vao, top_vao})
     glDeleteVertexArrays(1, &array);
   glfwDestroyWindow(window);
   glfwTerminate();

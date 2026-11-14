@@ -6,13 +6,16 @@ set "STL_PATH=%~1"
 if not defined STL_PATH set "STL_PATH=%USERPROFILE%\Downloads\_24-000.stl"
 
 if not exist "%STL_PATH%" (
-  echo ERROR: STL file not found:
-  echo   %STL_PATH%
-  echo.
-  echo Put _24-000.stl in your Downloads folder, or run:
-  echo   .\run_windows.bat "C:\full\path\car.stl"
+  echo Select the FULL CAR STL from your computer...
+  set "STL_PATH="
+  for /f "usebackq delims=" %%F in (`powershell -NoProfile -STA -Command "Add-Type -AssemblyName System.Windows.Forms; $solarPicker = New-Object System.Windows.Forms.OpenFileDialog; $solarPicker.Filter = 'STL files (*.stl)' + [char]124 + '*.stl'; $solarPicker.Title = 'Select the full car STL'; if ($solarPicker.ShowDialog() -eq 'OK') { [Console]::WriteLine($solarPicker.FileName) }"`) do set "STL_PATH=%%F"
+)
+if not defined STL_PATH (
+  echo No full-car STL selected.
   exit /b 2
 )
+if not exist "%STL_PATH%" exit /b 2
+set "TOP_SHELL_PATH=%~2"
 
 where winget >nul 2>nul
 if errorlevel 1 (
@@ -168,5 +171,9 @@ if errorlevel 1 exit /b 24
 
 echo Starting simulator with:
 echo   %STL_PATH%
-"%~dp0build\release\solar_whitted_cpp.exe" --stl "%STL_PATH%" --rays 64 --output "%~dp0results\cell-irradiance.csv"
+if defined TOP_SHELL_PATH (
+  "%~dp0build\release\solar_whitted_cpp.exe" --stl "%STL_PATH%" --top-shell "%TOP_SHELL_PATH%" --rays 64 --output "%~dp0results\cell-irradiance.csv"
+) else (
+  "%~dp0build\release\solar_whitted_cpp.exe" --stl "%STL_PATH%" --rays 64 --output "%~dp0results\cell-irradiance.csv"
+)
 exit /b %errorlevel%

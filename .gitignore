@@ -3,5 +3,6 @@ vcpkg_installed/
 CMakeUserPresets.json
 results/
 *.csv
+!data/track/oir_centerline.csv
 *.stl
 .DS_Store
