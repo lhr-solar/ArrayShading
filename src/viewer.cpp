@@ -140,7 +140,7 @@ struct LoadedTopShell {
 };
 
 #ifdef _WIN32
-std::string browse_stl() {
+std::string browse_stl(const wchar_t* title) {
   wchar_t file[32768]{};
   OPENFILENAMEW dialog{};
   dialog.lStructSize = sizeof(dialog);
@@ -149,7 +149,7 @@ std::string browse_stl() {
   dialog.lpstrFile = file;
   dialog.nMaxFile = static_cast<DWORD>(std::size(file));
   dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-  dialog.lpstrTitle = L"Select the assembly-aligned top-shell STL";
+  dialog.lpstrTitle = title;
   if (!GetOpenFileNameW(&dialog)) return {};
   const int length = WideCharToMultiByte(CP_UTF8, 0, file, -1, nullptr, 0, nullptr, nullptr);
   if (length <= 1) return {};
@@ -448,7 +448,7 @@ float wrapped_degrees(float value) {
 
 }  // namespace
 
-void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
+void show_viewer(std::shared_ptr<const ViewerCar> car,
                  std::vector<Cell>& cells, Sun& sun,
                  SimulationSettings& settings, SimulationSummary& summary,
                  LayoutSummary& layout_summary,
@@ -502,8 +502,8 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
     glBindVertexArray(shell_vao);
     glBindBuffer(GL_ARRAY_BUFFER, shell_vbo);
     glBufferData(GL_ARRAY_BUFFER,
-                 static_cast<GLsizeiptr>(mesh.vertices.size() * sizeof(Vec3)),
-                 mesh.vertices.data(), GL_STATIC_DRAW);
+                 static_cast<GLsizeiptr>(car->mesh.vertices.size() * sizeof(Vec3)),
+                 car->mesh.vertices.data(), GL_STATIC_DRAW);
     if (glGetError() == GL_OUT_OF_MEMORY)
       throw std::runtime_error(
           "GPU could not hold the complete STL. Run with --headless or export "
@@ -515,7 +515,7 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
 
     std::vector<RenderVertex> rendered_cells = cell_vertices(cells);
     std::vector<RenderVertex> rendered_outlines = cell_outlines(cells);
-    const std::vector<RenderVertex> rendered_grid = ground_grid(mesh.bounds);
+    auto rendered_grid = ground_grid(car->mesh.bounds);
 
     glGenVertexArrays(1, &cells_vao);
     glGenBuffers(1, &cells_vbo);
@@ -535,7 +535,7 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
     glGenVertexArrays(1, &sun_vao);
     glGenBuffers(1, &sun_vbo);
     configure_render_vao(sun_vao, sun_vbo);
-    auto rendered_sun = sun_vertices(mesh.bounds, sun.direction_to_sun);
+    auto rendered_sun = sun_vertices(car->mesh.bounds, sun.direction_to_sun);
     glBindBuffer(GL_ARRAY_BUFFER, sun_vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(rendered_sun), rendered_sun.data(),
                  GL_DYNAMIC_DRAW);
@@ -548,10 +548,10 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
     configure_render_vao(top_vao, top_vbo);
 
     Camera camera;
-    camera.target = mesh.bounds.center();
+    camera.target = car->mesh.bounds.center();
     camera.home_distance =
-        1.65f * std::max({mesh.bounds.extent().x, mesh.bounds.extent().y,
-                          mesh.bounds.extent().z});
+        1.65f * std::max({car->mesh.bounds.extent().x, car->mesh.bounds.extent().y,
+                          car->mesh.bounds.extent().z});
     camera.reset();
     Camera track_camera = camera;
     bool track_view = false;
@@ -614,13 +614,21 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
     std::optional<RaceJob> race_result;
     std::optional<RaceConfig> race_config;
     std::string race_status;
+    auto car_path = geometry_inputs.car_path;
+    struct CarLoad {
+      std::shared_ptr<const ViewerCar> model;
+      std::filesystem::path path;
+    };
+    std::future<CarLoad> car_future;
+    bool car_loading = false;
+    std::string car_status;
     char top_shell_path[4096]{};
     std::shared_ptr<LoadedTopShell> loaded_top;
     std::shared_ptr<LoadedTopShell> pending_top;
     Transform top_correction = geometry_inputs.top_correction;
     std::vector<RenderVertex> rendered_top;
     std::string top_status = "Load the separate top-shell STL before optimizing";
-    const auto load_top_shell = [&] {
+    const auto clear_placement = [&] {
       loaded_top.reset();
       pending_top.reset();
       rendered_top.clear();
@@ -631,6 +639,12 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       upload_vertices(outlines_vbo, rendered_outlines);
       breakdown = {};
       race_average = false;
+      inputs_dirty = false;
+      status = "No simulation result for this geometry";
+      race_status.clear();
+    };
+    const auto load_top_shell = [&] {
+      clear_placement();
       try {
         const auto path = std::filesystem::u8path(top_shell_path);
         auto source = load_binary_stl(path, geometry_inputs.transform);
@@ -641,7 +655,7 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
         camera.target = source.bounds.center();
         camera.home_distance = 1.65f * std::max({source.bounds.extent().x, source.bounds.extent().y, source.bounds.extent().z});
         camera.reset();
-        auto prepared = prepare_placement_surface(source, scene,
+        auto prepared = prepare_placement_surface(source, car->scene,
             {.alignment_tolerance_m = 0.005f,
              .minimum_upward_normal_z = region.minimum_upward_normal_z});
         pending_top = std::make_shared<LoadedTopShell>(std::move(prepared), path);
@@ -685,6 +699,44 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
 
     while (!glfwWindowShouldClose(window)) {
       glfwPollEvents();
+      if (car_loading && car_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        try {
+          auto replacement = car_future.get();
+          auto new_grid = ground_grid(replacement.model->mesh.bounds);
+          GLuint new_buffer = 0;
+          // Upload before replacing the live mesh and BVH, so a failed load
+          // leaves the previous car and results available.
+          while (glGetError() != GL_NO_ERROR) {}
+          glGenBuffers(1, &new_buffer);
+          glBindBuffer(GL_ARRAY_BUFFER, new_buffer);
+          glBufferData(GL_ARRAY_BUFFER,
+              static_cast<GLsizeiptr>(replacement.model->mesh.vertices.size() * sizeof(Vec3)),
+              replacement.model->mesh.vertices.data(), GL_STATIC_DRAW);
+          if (glGetError() != GL_NO_ERROR || !new_buffer) {
+            if (new_buffer) glDeleteBuffers(1, &new_buffer);
+            throw std::runtime_error("Could not upload the selected car STL to the GPU");
+          }
+          glBindVertexArray(shell_vao);
+          glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vec3), nullptr);
+          glDeleteBuffers(1, &shell_vbo);
+          shell_vbo = new_buffer;
+          car = std::move(replacement.model);
+          car_path = std::move(replacement.path);
+          rendered_grid = std::move(new_grid);
+          upload_vertices(grid_vbo, rendered_grid, GL_STATIC_DRAW);
+          const auto& bounds = car->mesh.bounds;
+          camera.target = bounds.center();
+          camera.home_distance = 1.65f * std::max({bounds.extent().x, bounds.extent().y, bounds.extent().z});
+          camera.reset();
+          car_status = "Car loaded. Previous layout cleared.";
+          if (top_shell_path[0] != '\0') load_top_shell();
+          else {
+            clear_placement();
+            top_status = "Load the separate top-shell STL before optimizing";
+          }
+        } catch (const std::exception& error) { car_status = error.what(); }
+        car_loading = false;
+      }
       if (race_running && race_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         try {
           race_result = race_future.get();
@@ -769,31 +821,51 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       ImGui::Spacing();
 
       ImGui::TextDisabled("LOCAL GEOMETRY FILES");
-      ImGui::TextWrapped("Full car: %s", geometry_inputs.car_path.string().c_str());
-      ImGui::BeginDisabled(race_running);
+      ImGui::TextWrapped("Full car: %s", car_path.string().c_str());
+      ImGui::BeginDisabled(race_running || car_loading);
+#ifdef _WIN32
+      if (ImGui::Button("Browse full-car STL")) {
+        const auto selected = browse_stl(L"Select the full-car or aero assembly STL");
+        if (!selected.empty()) {
+          try {
+            const auto path = std::filesystem::u8path(selected);
+            const auto transform = geometry_inputs.transform;
+            car_future = std::async(std::launch::async, [path, transform] {
+              return CarLoad{std::make_shared<ViewerCar>(load_binary_stl(path, transform)), path};
+            });
+            car_loading = true;
+            car_status = "Loading car STL and rebuilding the ray-tracing scene...";
+          } catch (const std::exception& error) { car_status = error.what(); }
+        }
+      }
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Uses the current launch scale and coordinate transform for both STLs");
+#endif
+      if (!car_status.empty()) ImGui::TextWrapped("%s", car_status.c_str());
       ImGui::SetNextItemWidth(-1.0f);
       bool correction_changed = ImGui::InputText("##top-shell-path", top_shell_path, sizeof(top_shell_path));
       ImGui::TextDisabled("Optional VERIFIED correction, after the common STL transform");
       correction_changed |= ImGui::InputFloat3("Shell offset (m)", &top_correction.translation.x, "%.4f");
       correction_changed |= ImGui::InputFloat3("Shell XYZ rotation (deg)", &top_correction.rotation_degrees.x, "%.3f");
       if (correction_changed) {
-        loaded_top.reset(); pending_top.reset();
-        cells.clear(); summary = {}; layout_summary = {}; race_result.reset(); breakdown = {};
-        rendered_cells.clear(); rendered_outlines.clear(); rendered_top.clear();
-        upload_vertices(cells_vbo, rendered_cells); upload_vertices(outlines_vbo, rendered_outlines);
+        clear_placement();
         top_status = "File or correction changed; reload to validate. No automatic registration is applied.";
       }
 #ifdef _WIN32
       if (ImGui::Button("Browse top-shell STL")) {
-        const auto selected = browse_stl();
+        const auto selected = browse_stl(L"Select the assembly-aligned top-shell STL");
         if (!selected.empty() && selected.size() < sizeof(top_shell_path)) {
           std::memcpy(top_shell_path, selected.c_str(), selected.size() + 1);
           load_top_shell();
+        } else if (!selected.empty()) {
+          top_status = "Top-shell path is too long";
         }
       }
       ImGui::SameLine();
 #endif
       if (ImGui::Button("Load top shell")) load_top_shell();
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Load the path above, or recheck alignment after changing the shell offset or rotation");
       ImGui::EndDisabled();
       ImGui::TextWrapped("%s", top_status.c_str());
       const auto checked_top = loaded_top ? loaded_top : pending_top;
@@ -804,7 +876,7 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
             checked_top->surface.max_alignment_error_m * 1000.0);
         ImGui::TextWrapped("Unmatched shell regions are excluded from placement.");
       }
-      if (pending_top && !loaded_top && !race_running && ImGui::Button("Approve validated shell alignment")) {
+      if (pending_top && !loaded_top && !race_running && !car_loading && ImGui::Button("Approve validated shell alignment")) {
         loaded_top = pending_top;
         rendered_top.clear();
         for (const auto& point : loaded_top->surface.mesh.vertices)
@@ -831,7 +903,7 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
 
       ImGui::TextDisabled("TIMED TRACK LAYOUT OPTIMIZER");
       ImGui::TextWrapped("Config: %s", race_config_path.string().c_str());
-      ImGui::BeginDisabled(race_running);
+      ImGui::BeginDisabled(race_running || car_loading);
       if (ImGui::Button("Reload race config")) {
         try { race_config = load_race_config(race_config_path); race_status.clear(); load_track_view(); }
         catch (const std::exception& error) { race_config.reset(); race_status = error.what(); }
@@ -855,13 +927,14 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
           const auto config = *race_config;
           const auto trace_settings = settings;
           const auto top_snapshot = loaded_top;
-          race_future = std::async(std::launch::async, [&, config, trace_settings, top_snapshot] {
+          const auto car_snapshot = car;
+          race_future = std::async(std::launch::async, [&, config, trace_settings, top_snapshot, car_snapshot] {
             RaceJob job;
             job.config = config;
             const auto track = load_track(config.track_path);
             job.race = build_race_run(config, track);
             job.optimized = optimize_race_layout(top_snapshot->scene,
-                top_snapshot->surface.mesh.bounds, scene, grid,
+                top_snapshot->surface.mesh.bounds, car_snapshot->scene, grid,
                 top_snapshot->surface.region, job.race, trace_settings, optimization_settings(config));
             return job;
           });
@@ -969,10 +1042,10 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       else
         ImGui::TextColored({0.35f, 0.80f, 0.55f, 1.0f}, "%s", status.c_str());
 
-      ImGui::BeginDisabled(race_running);
+      ImGui::BeginDisabled(race_running || car_loading);
       if (ImGui::Button("RUN SIMULATION", {-1.0f, 42.0f})) {
         const auto start = std::chrono::steady_clock::now();
-        summary = simulate_cells(cells, scene, sun, settings);
+        summary = simulate_cells(cells, car->scene, sun, settings);
         breakdown = calculate_breakdown(cells);
         rendered_cells = cell_vertices(cells);
         rendered_outlines = cell_outlines(cells);
@@ -1034,7 +1107,7 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       ImGui::Spacing();
       ImGui::Separator();
       ImGui::TextDisabled("%zu triangles  |  drag to orbit  |  wheel to zoom",
-                          mesh.triangle_count());
+                          car->mesh.triangle_count());
       ImGui::TextDisabled("Electrical estimate: constant efficiency, no MPPT/string losses");
       ImGui::End();
 
@@ -1091,7 +1164,7 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
         far_point /= far_point.w;
         const glm::vec3 ray = glm::normalize(
             glm::vec3(far_point) - glm::vec3(near_point));
-        const auto hit = scene.intersect(
+        const auto hit = car->scene.intersect(
             {eye.x, eye.y, eye.z}, {ray.x, ray.y, ray.z},
             settings.ray_epsilon_m, 1.0e30f, kCarMask);
         if (hit) {
@@ -1152,7 +1225,7 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
         glBindVertexArray(shell_vao);
         if (wireframe) glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
         glDrawArrays(GL_TRIANGLES, 0,
-                     static_cast<GLsizei>(mesh.vertices.size()));
+                     static_cast<GLsizei>(car->mesh.vertices.size()));
         if (wireframe) glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
       }
 
@@ -1187,7 +1260,7 @@ void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
       }
 
       if (show_sun) {
-        rendered_sun = sun_vertices(mesh.bounds, sun.direction_to_sun);
+        rendered_sun = sun_vertices(car->mesh.bounds, sun.direction_to_sun);
         glBindBuffer(GL_ARRAY_BUFFER, sun_vbo);
         glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(rendered_sun),
                         rendered_sun.data());

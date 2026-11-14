@@ -1,6 +1,8 @@
 #pragma once
 
 #include <filesystem>
+#include <memory>
+#include <utility>
 #include <vector>
 
 #include "solar/simulation.hpp"
@@ -16,7 +18,16 @@ struct ViewerGeometryInputs {
   Transform top_correction{1.0f, {0, 0, 0}, {0, 0, 0}};
 };
 
-void show_viewer(const TriangleMesh& mesh, const TraceScene& scene,
+// Embree shares the vertex buffer, so the mesh must outlive its scene.
+struct ViewerCar {
+  TriangleMesh mesh;
+  TraceScene scene;
+  explicit ViewerCar(TriangleMesh geometry)
+      : mesh(std::move(geometry)), scene(mesh) {}
+  ViewerCar(ViewerCar&&) = delete;
+};
+
+void show_viewer(std::shared_ptr<const ViewerCar> car,
                  std::vector<Cell>& cells, Sun& sun,
                  SimulationSettings& settings, SimulationSummary& summary,
                  LayoutSummary& layout_summary,

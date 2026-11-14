@@ -287,7 +287,8 @@ int main(int argc, char** argv) {
 
     start = Clock::now();
     std::cout << "Building Embree BVH (this is the ray-tracing geometry)...\n";
-    solar::TraceScene scene(mesh);
+    auto car = std::make_shared<solar::ViewerCar>(std::move(mesh));
+    const auto& scene = car->scene;
     std::cout << "BVH built in " << elapsed_seconds(start) << " s\n";
 
     start = Clock::now();
@@ -302,7 +303,7 @@ int main(int argc, char** argv) {
         eligible_shell = std::move(prepared.mesh);
         placement_region = prepared.region;
       } else {
-        eligible_shell = solar::filter_eligible_shell(mesh, options.shell_region);
+        eligible_shell = solar::filter_eligible_shell(car->mesh, options.shell_region);
       }
       std::cout << "Eligible placement shell: "
                 << eligible_shell.triangle_count() << " triangles\n";
@@ -368,7 +369,7 @@ int main(int argc, char** argv) {
       std::cout << "Opening OpenGL viewer...\n";
       solar::Sun interactive_sun = options.sun;
       solar::SimulationSettings interactive_settings = options.simulation;
-      solar::show_viewer(mesh, scene, cells, interactive_sun,
+      solar::show_viewer(std::move(car), cells, interactive_sun,
                          interactive_settings, summary, layout_summary,
                          options.grid, options.shell_region,
                          {options.stl_path, options.top_shell_path, options.transform, options.top_correction}, options.race_config_path,

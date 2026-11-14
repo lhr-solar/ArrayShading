@@ -3,6 +3,10 @@ setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
 set "STL_PATH=%~1"
+set "TOP_SHELL_PATH=%~2"
+set "AERO_NAME=24-AER-1000 (Aeroshell).STL"
+set "FIXED_SHELL_NAME=24-AER-1001 (Top Shell) Fixed Coords.STL"
+if not defined STL_PATH if exist "%USERPROFILE%\Downloads\%AERO_NAME%" if exist "%USERPROFILE%\Downloads\%FIXED_SHELL_NAME%" set "STL_PATH=%USERPROFILE%\Downloads\%AERO_NAME%"
 if not defined STL_PATH set "STL_PATH=%USERPROFILE%\Downloads\_24-000.stl"
 
 if not exist "%STL_PATH%" (
@@ -15,7 +19,14 @@ if not defined STL_PATH (
   exit /b 2
 )
 if not exist "%STL_PATH%" exit /b 2
-set "TOP_SHELL_PATH=%~2"
+
+rem The verified aero exports use millimeters and differ by +83.449 mm in X.
+set "MODEL_ARGS="
+for %%F in ("%STL_PATH%") do if /I "%%~nxF"=="%AERO_NAME%" (
+  set "MODEL_ARGS=--scale 0.001"
+  if not defined TOP_SHELL_PATH if exist "%%~dpF%FIXED_SHELL_NAME%" set "TOP_SHELL_PATH=%%~dpF%FIXED_SHELL_NAME%"
+  if defined TOP_SHELL_PATH for %%S in ("!TOP_SHELL_PATH!") do if /I "%%~nxS"=="%FIXED_SHELL_NAME%" set "MODEL_ARGS=--scale 0.001 --top-offset-x 0.083449"
+)
 
 where winget >nul 2>nul
 if errorlevel 1 (
@@ -170,10 +181,10 @@ cmake --build --preset release-vcpkg
 if errorlevel 1 exit /b 24
 
 echo Starting simulator with:
-echo   %STL_PATH%
+echo   "%STL_PATH%"
 if defined TOP_SHELL_PATH (
-  "%~dp0build\release\solar_whitted_cpp.exe" --stl "%STL_PATH%" --top-shell "%TOP_SHELL_PATH%" --rays 64 --output "%~dp0results\cell-irradiance.csv"
+  "%~dp0build\release\solar_whitted_cpp.exe" --stl "%STL_PATH%" --top-shell "%TOP_SHELL_PATH%" %MODEL_ARGS% --rays 64 --output "%~dp0results\cell-irradiance.csv"
 ) else (
-  "%~dp0build\release\solar_whitted_cpp.exe" --stl "%STL_PATH%" --rays 64 --output "%~dp0results\cell-irradiance.csv"
+  "%~dp0build\release\solar_whitted_cpp.exe" --stl "%STL_PATH%" %MODEL_ARGS% --rays 64 --output "%~dp0results\cell-irradiance.csv"
 )
 exit /b %errorlevel%
