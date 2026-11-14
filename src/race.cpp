@@ -95,7 +95,6 @@ void validate_config(const RaceConfig& config) {
       !positive_finite(config.track_step_m) ||
       !positive_finite(config.position_step_m) ||
       !positive_finite(config.angle_step_degrees) ||
-      !positive_finite(config.solver_time_limit_seconds) ||
       !std::isfinite(config.cell_efficiency) || config.cell_efficiency <= 0.0 ||
       config.cell_efficiency > 1.0 || config.angle_step_degrees > 180.0) {
     throw std::runtime_error("Race config contains an out-of-range numeric value");
@@ -227,7 +226,6 @@ RaceConfig load_race_config(const std::filesystem::path& path) {
   config.track_step_m = number(json, "track_step_m", config.track_step_m);
   config.position_step_m = number(json, "position_step_m", config.position_step_m);
   config.angle_step_degrees = number(json, "angle_step_degrees", config.angle_step_degrees);
-  config.solver_time_limit_seconds = number(json, "solver_time_limit_seconds", config.solver_time_limit_seconds);
   validate_config(config);
   return config;
 }
@@ -260,8 +258,7 @@ void save_race_config(const std::filesystem::path& path,
                       {"cell_efficiency", config.cell_efficiency},
                       {"track_step_m", config.track_step_m},
                       {"position_step_m", config.position_step_m},
-                      {"angle_step_degrees", config.angle_step_degrees},
-                      {"solver_time_limit_seconds", config.solver_time_limit_seconds}};
+                      {"angle_step_degrees", config.angle_step_degrees}};
   std::ofstream output(output_path);
   if (!output)
     throw std::runtime_error("Cannot write race config: " + output_path.string());

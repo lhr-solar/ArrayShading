@@ -11,6 +11,5 @@
   "cell_efficiency": 0.243,
   "track_step_m": 100.0,
   "position_step_m": 0.128,
-  "angle_step_degrees": 15.0,
-  "solver_time_limit_seconds": 60.0
+  "angle_step_degrees": 15.0
 }

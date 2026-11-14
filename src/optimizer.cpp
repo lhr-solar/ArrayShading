@@ -225,14 +225,13 @@ void validate_settings(const OptimizationSettings& settings) {
   if (!std::isfinite(settings.max_active_area_m2) ||
       !std::isfinite(settings.position_step_m) ||
       !std::isfinite(settings.angle_step_degrees) ||
-      !std::isfinite(settings.time_limit_seconds) ||
       !std::isfinite(settings.cell_gap_m) ||
       !std::isfinite(settings.efficiency) ||
       !(settings.max_active_area_m2 > 0.0) ||
       !(settings.position_step_m > 0.0) ||
       !(settings.angle_step_degrees > 0.0 &&
         settings.angle_step_degrees <= 180.0) ||
-      !(settings.time_limit_seconds > 0.0) || !(settings.cell_gap_m >= 0.0) ||
+      !(settings.cell_gap_m >= 0.0) ||
       !(settings.efficiency > 0.0 && settings.efficiency <= 1.0))
     throw std::invalid_argument("Invalid optimization settings");
 }
@@ -244,7 +243,6 @@ OptimizationSettings optimization_settings(const RaceConfig& config) {
   settings.max_active_area_m2 = config.max_active_area_m2;
   settings.position_step_m = config.position_step_m;
   settings.angle_step_degrees = config.angle_step_degrees;
-  settings.time_limit_seconds = config.solver_time_limit_seconds;
   settings.cell_gap_m = 0.003;
   settings.efficiency = config.cell_efficiency;
   validate_settings(settings);
@@ -269,9 +267,7 @@ void write_optimized_race(const std::filesystem::path& path,
                       {"cell_efficiency", config.cell_efficiency},
                       {"track_step_m", config.track_step_m},
                       {"position_step_m", config.position_step_m},
-                      {"angle_step_degrees", config.angle_step_degrees},
-                      {"solver_time_limit_seconds",
-                       config.solver_time_limit_seconds}};
+                      {"angle_step_degrees", config.angle_step_degrees}};
   output["race"] = {{"duration_seconds", race.duration_seconds},
                     {"distance_m", race.distance_m},
                     {"laps", race.laps},
@@ -406,7 +402,9 @@ std::vector<ModuleCandidate> generate_module_candidates(
 
 OptimizedLayout solve_module_packing(
     const std::vector<ModuleCandidate>& candidates,
-    const OptimizationSettings& settings) {
+    const OptimizationSettings& settings,
+    const OptimizationProgressCallback& progress,
+    const OptimizationStopCallback& stop) {
   validate_settings(settings);
   OptimizedLayout output;
   output.candidate_modules = candidates.size();
@@ -414,6 +412,7 @@ OptimizedLayout solve_module_packing(
     output.status = "No feasible modules";
     return output;
   }
+  if (progress) progress({OptimizationPhase::packing_setup});
   for (const ModuleCandidate& candidate : candidates) {
     if ((candidate.cells.size() != 3U && candidate.cells.size() != 6U) ||
         !std::isfinite(candidate.energy_wh) || candidate.energy_wh < 0.0)
@@ -426,7 +425,6 @@ OptimizedLayout solve_module_packing(
 
   Highs highs;
   highs.setOptionValue("output_flag", false);
-  highs.setOptionValue("time_limit", settings.time_limit_seconds);
   highs.setOptionValue("mip_rel_gap", 1.0e-9);
   highs.setOptionValue("mip_abs_gap", 1.0e-9);
   HighsModel model;
@@ -437,8 +435,17 @@ OptimizedLayout solve_module_packing(
   lp.col_lower_.assign(n, 0.0);
   lp.col_upper_.assign(n, 1.0);
   model.lp_.integrality_.assign(n, HighsVarType::kInteger);
-  for (HighsInt i = 0; i < n; ++i)
-    lp.col_cost_[i] = -candidates[static_cast<std::size_t>(i)].energy_wh;
+  std::vector<double> areas(candidates.size());
+  std::vector<double> energies(candidates.size());
+  std::vector<double> twos(candidates.size());
+  for (std::size_t i = 0; i < candidates.size(); ++i) {
+    const auto& candidate = candidates[i];
+    areas[i] = std::accumulate(candidate.cells.begin(), candidate.cells.end(), 0.0,
+        [](double sum, const Cell& cell) { return sum + cell.active_area_m2; });
+    energies[i] = candidate.energy_wh;
+    twos[i] = candidate.cells.size() == 6 ? 1.0 : 0.0;
+    lp.col_cost_[i] = -energies[i];
+  }
 
   std::set<std::pair<HighsInt, HighsInt>> conflict_set;
   constexpr float kBucketSize = 0.25f;
@@ -509,143 +516,163 @@ OptimizedLayout solve_module_packing(
     rows.push_back(area_row);
     lp.a_matrix_.index_.insert(lp.a_matrix_.index_.end(), rows.begin(), rows.end());
     for (const HighsInt row : rows)
-      lp.a_matrix_.value_.push_back(
-          row == area_row
-              ? std::accumulate(candidates[static_cast<std::size_t>(col)].cells.begin(),
-                                candidates[static_cast<std::size_t>(col)].cells.end(),
-                                0.0, [](double sum, const Cell& cell) {
-                                  return sum + cell.active_area_m2;
-                                })
-              : 1.0);
+      lp.a_matrix_.value_.push_back(row == area_row ? areas[col] : 1.0);
     lp.a_matrix_.start_[static_cast<std::size_t>(col) + 1U] =
         static_cast<HighsInt>(lp.a_matrix_.index_.size());
   }
-  const HighsStatus pass_status = highs.passModel(model);
-  if (pass_status == HighsStatus::kError)
+  // Always start with a feasible layout. Even if the search is interrupted,
+  // do not discard this layout for a weaker solver incumbent.
+  std::vector<std::size_t> order(candidates.size());
+  std::iota(order.begin(), order.end(), 0);
+  std::stable_sort(order.begin(), order.end(), [&](auto a, auto b) {
+    if (energies[a] != energies[b]) return energies[a] > energies[b];
+    if (areas[a] != areas[b]) return areas[a] > areas[b];
+    return twos[a] > twos[b];
+  });
+  std::vector<double> selected_values(candidates.size(), 0.0);
+  std::vector<bool> blocked(candidates.size(), false);
+  double used_area = 0.0;
+  double best_energy = 0.0;
+  double best_area = 0.0;
+  double best_twos = 0.0;
+  for (const auto i : order) {
+    if (blocked[i]) continue;
+    if (used_area + areas[i] > settings.max_active_area_m2) continue;
+    selected_values[i] = 1.0;
+    used_area += areas[i];
+    for (const auto row : conflict_rows[i]) {
+      const auto [a, b] = conflicts[static_cast<std::size_t>(row)];
+      blocked[static_cast<std::size_t>(a == static_cast<HighsInt>(i) ? b : a)] = true;
+    }
+  }
+  // Sum in the same order used for solver incumbents.
+  for (std::size_t i = 0; i < candidates.size(); ++i) {
+    if (selected_values[i] < 0.5) continue;
+    best_energy += energies[i];
+    best_area += areas[i];
+    best_twos += twos[i];
+  }
+  const double seed_energy = best_energy;
+  constexpr double kAreaTolerance = 1.0e-12;
+  const auto consider_solution = [&](const HighsSolution& solution, double energy_floor,
+                                     double area_floor, OptimizationPhase phase) {
+    if (!solution.value_valid || solution.col_value.size() != candidates.size()) return false;
+    double energy = 0.0;
+    double area = 0.0;
+    double two_by_three_count = 0;
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+      const double x = solution.col_value[i];
+      if (!std::isfinite(x) || std::abs(x - (x >= 0.5 ? 1.0 : 0.0)) > 1.0e-6) return false;
+      if (x < 0.5) continue;
+      area += areas[i];
+      energy += energies[i];
+      two_by_three_count += twos[i];
+    }
+    if (area > settings.max_active_area_m2 + kAreaTolerance ||
+        energy < energy_floor || area + kAreaTolerance < area_floor) return false;
+    for (const auto& [a, b] : conflicts)
+      if (solution.col_value[a] >= 0.5 && solution.col_value[b] >= 0.5) return false;
+    const bool better_area = area > best_area + kAreaTolerance;
+    const bool same_area = std::abs(area - best_area) <= kAreaTolerance;
+    const bool better_grouping = same_area && two_by_three_count > best_twos;
+    const bool better = phase == OptimizationPhase::solving
+        ? energy > best_energy || (energy == best_energy && (better_area || better_grouping))
+        : better_area || better_grouping;
+    if (better) {
+      selected_values = solution.col_value;
+      best_energy = energy;
+      best_area = area;
+      best_twos = two_by_three_count;
+    }
+    return true;
+  };
+  const auto configure_search = [&](Highs& solver, OptimizationPhase phase) {
+    if (!progress && !stop) return;
+    solver.setCallback([&, phase](int, const std::string&, const HighsCallbackOutput* data,
+                                 HighsCallbackInput* input, void*) {
+      if (input && stop && stop()) input->user_interrupt = true;
+      if (progress && phase == OptimizationPhase::solving && data) {
+        const double best = std::isfinite(data->mip_primal_bound)
+            ? std::max(best_energy, -data->mip_primal_bound) : best_energy;
+        const double upper = -data->mip_dual_bound;
+        const double gap = std::isfinite(upper) && upper > 0
+            ? std::clamp((upper - best) / upper, 0.0, 1.0) : -1.0;
+        progress({phase, 0, 0, best * settings.efficiency, gap});
+      }
+    }, nullptr);
+    solver.startCallback(kCallbackMipInterrupt);
+  };
+  if (highs.passModel(model) == HighsStatus::kError)
     throw std::runtime_error("HiGHS rejected module-packing model");
-  highs.run();
-  const HighsModelStatus model_status = highs.getModelStatus();
-  output.proven_optimal = model_status == HighsModelStatus::kOptimal;
-  output.status = highs.modelStatusToString(model_status);
-  const HighsInfo& info = highs.getInfo();
-  const bool primary_has_solution = highs.getSolution().value_valid;
+  std::vector<HighsInt> columns(candidates.size());
+  std::iota(columns.begin(), columns.end(), 0);
+  highs.setSolution(n, columns.data(), selected_values.data());
+  configure_search(highs, OptimizationPhase::solving);
+  if (progress) progress({OptimizationPhase::solving, 0, 0, best_energy * settings.efficiency});
+  const bool stopped_before_search = stop && stop();
+  if (!stopped_before_search) highs.run();
+  const auto model_status = highs.getModelStatus();
+  const auto& info = highs.getInfo();
+  output.energy_upper_bound_wh = -1.0;
   if (info.valid && std::isfinite(info.mip_dual_bound))
     output.energy_upper_bound_wh = std::max(0.0, -info.mip_dual_bound);
+  const bool solver_result_valid = !stopped_before_search &&
+      consider_solution(highs.getSolution(), seed_energy, 0.0, OptimizationPhase::solving);
+  output.proven_optimal = model_status == HighsModelStatus::kOptimal && solver_result_valid;
+  output.status = stopped_before_search ? "Stopped (feasible starting layout)"
+                                       : highs.modelStatusToString(model_status);
+  if (!stopped_before_search && !solver_result_valid) output.status += " (feasible starting layout retained)";
 
-  std::vector<double> selected_values;
-  if (primary_has_solution) selected_values = highs.getSolution().col_value;
-  if (output.proven_optimal && primary_has_solution) {
-    double primary_energy = 0.0;
-    for (std::size_t i = 0; i < candidates.size(); ++i)
-      if (i < selected_values.size() && selected_values[i] >= 0.5)
-        primary_energy += candidates[i].energy_wh;
-    const double energy_tolerance =
-        1.0e-9 * std::max(1.0, std::abs(primary_energy));
-    const double remaining_seconds =
-        settings.time_limit_seconds - highs.getRunTime();
-    if (remaining_seconds > 0.001) {
-      HighsModel secondary_model = model;
-      HighsLp& secondary_lp = secondary_model.lp_;
-      const HighsInt tie_row = secondary_lp.num_row_++;
-      secondary_lp.row_lower_.push_back(primary_energy - energy_tolerance);
-      secondary_lp.row_upper_.push_back(kHighsInf);
-      const auto original_start = secondary_lp.a_matrix_.start_;
-      const auto original_index = secondary_lp.a_matrix_.index_;
-      const auto original_value = secondary_lp.a_matrix_.value_;
-      secondary_lp.a_matrix_.start_.assign(static_cast<std::size_t>(n) + 1U,
-                                           0);
-      secondary_lp.a_matrix_.index_.clear();
-      secondary_lp.a_matrix_.value_.clear();
-      for (HighsInt col = 0; col < n; ++col) {
-        for (HighsInt nz = original_start[static_cast<std::size_t>(col)];
-             nz < original_start[static_cast<std::size_t>(col) + 1U]; ++nz) {
-          secondary_lp.a_matrix_.index_.push_back(
-              original_index[static_cast<std::size_t>(nz)]);
-          secondary_lp.a_matrix_.value_.push_back(
-              original_value[static_cast<std::size_t>(nz)]);
-        }
-        secondary_lp.a_matrix_.index_.push_back(tie_row);
-        secondary_lp.a_matrix_.value_.push_back(
-            candidates[static_cast<std::size_t>(col)].energy_wh);
-        secondary_lp.a_matrix_.start_[static_cast<std::size_t>(col) + 1U] =
-            static_cast<HighsInt>(secondary_lp.a_matrix_.index_.size());
-        secondary_lp.col_cost_[static_cast<std::size_t>(col)] =
-            candidates[static_cast<std::size_t>(col)].cells.size() == 6U
-                ? -1.0
-                : 0.0;
-      }
-      Highs secondary;
-      secondary.setOptionValue("output_flag", false);
-      secondary.setOptionValue("time_limit", remaining_seconds);
-      const HighsStatus secondary_pass = secondary.passModel(secondary_model);
-      if (secondary_pass != HighsStatus::kError) {
-        secondary.run();
-        if (secondary.getModelStatus() == HighsModelStatus::kOptimal &&
-            secondary.getSolution().value_valid) {
-          const auto& values = secondary.getSolution().col_value;
-          double tie_energy = 0.0;
-          for (std::size_t i = 0; i < candidates.size(); ++i)
-            if (i < values.size() && values[i] >= 0.5)
-              tie_energy += candidates[i].energy_wh;
-          if (tie_energy + energy_tolerance >= primary_energy)
-            selected_values = values;
-        }
-      }
-    }
+  if (output.proven_optimal) {
+    // The small Wh tolerance allows for floating-point summation between passes.
+    const double energy_floor = std::max(seed_energy,
+        best_energy - 1.0e-9 * std::max(1.0, std::abs(best_energy)));
+    const auto tie_break = [&](const std::vector<double>& objective, OptimizationPhase phase) {
+      if (stop && stop()) return false;
+      Highs solver;
+      solver.setOptionValue("output_flag", false);
+      solver.setOptionValue("mip_rel_gap", 1.0e-9);
+      solver.setOptionValue("mip_abs_gap", 1.0e-9);
+      if (solver.passModel(model) == HighsStatus::kError) return false;
+      for (HighsInt i = 0; i < n; ++i) solver.changeColCost(i, -objective[i]);
+      if (solver.addRow(energy_floor, kHighsInf, n, columns.data(), energies.data()) == HighsStatus::kError)
+        return false;
+      const bool fix_area = phase == OptimizationPhase::module_tie_break;
+      const double area_floor = fix_area ? best_area - kAreaTolerance : 0.0;
+      if (fix_area && solver.addRow(area_floor, kHighsInf, n, columns.data(), areas.data()) == HighsStatus::kError)
+        return false;
+      solver.setSolution(n, columns.data(), selected_values.data());
+      configure_search(solver, phase);
+      if (progress) progress({phase, 0, 0, best_energy * settings.efficiency, 0.0});
+      if (stop && stop()) return false;
+      solver.run();
+      const bool valid = consider_solution(solver.getSolution(), energy_floor, area_floor, phase);
+      return valid && solver.getModelStatus() == HighsModelStatus::kOptimal;
+    };
+    if (!tie_break(areas, OptimizationPhase::area_tie_break))
+      output.status += " (area tie-break not proven)";
+    else if (!tie_break(twos, OptimizationPhase::module_tie_break))
+      output.status += " (2x3 tie-break not proven)";
   }
-  bool has_feasible_solution = !selected_values.empty();
-  if (!has_feasible_solution) {
-    std::vector<std::size_t> order(candidates.size());
-    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
-    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
-      return candidates[a].energy_wh > candidates[b].energy_wh;
-    });
-    std::vector<bool> blocked(candidates.size(), false);
-    selected_values.assign(candidates.size(), 0.0);
-    double used_area = 0.0;
-    for (const std::size_t index : order) {
-      if (blocked[index]) continue;
-      const double area = std::accumulate(
-          candidates[index].cells.begin(), candidates[index].cells.end(), 0.0,
-          [](double sum, const Cell& cell) { return sum + cell.active_area_m2; });
-      if (used_area + area > settings.max_active_area_m2 + 1.0e-9) continue;
-      selected_values[index] = 1.0;
-      used_area += area;
-      for (const HighsInt row : conflict_rows[index]) {
-        const auto& pair = conflicts[static_cast<std::size_t>(row)];
-        const HighsInt other = pair.first == static_cast<HighsInt>(index)
-                                   ? pair.second
-                                   : pair.first;
-        blocked[static_cast<std::size_t>(other)] = true;
-      }
+
+  std::uint32_t module_id = 1;
+  for (std::size_t index = 0; index < candidates.size(); ++index) {
+    if (selected_values[index] < 0.5) continue;
+    const auto& candidate = candidates[index];
+    const std::uint32_t module_columns = candidate.cells.size() == 6U ? 2U : 1U;
+    for (std::size_t cell_index = 0; cell_index < candidate.cells.size(); ++cell_index) {
+      Cell cell = candidate.cells[cell_index];
+      cell.row = static_cast<std::uint32_t>(cell_index / module_columns);
+      cell.column = static_cast<std::uint32_t>(cell_index % module_columns);
+      cell.module_id = module_id;
+      cell.module_rows = 3U;
+      cell.module_columns = module_columns;
+      output.layout.cells.push_back(cell);
     }
-    has_feasible_solution = true;
-    output.status += " (greedy feasible fallback)";
-  }
-  if (has_feasible_solution) {
-    const auto& values = selected_values;
-    std::uint32_t module_id = 1;
-    for (std::size_t index = 0; index < candidates.size(); ++index) {
-      if (index >= values.size() || values[index] < 0.5) continue;
-      const auto& candidate = candidates[index];
-      const std::uint32_t columns = candidate.cells.size() == 6U ? 2U : 1U;
-      for (std::size_t cell_index = 0; cell_index < candidate.cells.size();
-           ++cell_index) {
-        Cell cell = candidate.cells[cell_index];
-        cell.row = static_cast<std::uint32_t>(cell_index / columns);
-        cell.column = static_cast<std::uint32_t>(cell_index % columns);
-        cell.module_id = module_id;
-        cell.module_rows = 3U;
-        cell.module_columns = columns;
-        output.layout.cells.push_back(cell);
-      }
-      if (columns == 2U)
-        ++output.layout.summary.two_by_three_modules;
-      else
-        ++output.layout.summary.one_by_three_modules;
-      output.optical_energy_wh += candidate.energy_wh;
-      ++module_id;
-    }
+    if (module_columns == 2U) ++output.layout.summary.two_by_three_modules;
+    else ++output.layout.summary.one_by_three_modules;
+    output.optical_energy_wh += candidate.energy_wh;
+    ++module_id;
   }
   output.layout.summary.individual_cells = output.layout.cells.size();
   output.electrical_energy_wh =
@@ -666,7 +693,9 @@ OptimizedLayout optimize_race_layout(
     const TraceScene& complete_trace_scene, const CellGrid& grid,
     const ShellRegion& region, const RaceRun& race,
     const SimulationSettings& simulation,
-    const OptimizationSettings& settings) {
+    const OptimizationSettings& settings,
+    const OptimizationProgressCallback& progress,
+    const OptimizationStopCallback& stop) {
   if (race.samples.empty() || !std::isfinite(race.duration_seconds) || race.duration_seconds <= 0)
     throw std::invalid_argument("Race needs positive duration and at least one timed sample");
   double duration_sum = 0;
@@ -679,6 +708,7 @@ OptimizedLayout optimize_race_layout(
     throw std::invalid_argument("Race sample weights must cover the complete race duration");
   OptimizationSettings effective_settings = settings;
   effective_settings.cell_gap_m = grid.gap_m;
+  if (progress) progress({OptimizationPhase::candidates});
   auto candidates = generate_module_candidates(placement_scene, bounds, grid,
                                               region, effective_settings);
   // A module is atomic: deleting individual failing cells could turn a 2x3
@@ -717,7 +747,11 @@ OptimizedLayout optimize_race_layout(
   std::map<PointKey, double> energy;
   std::map<PointKey, std::array<double, 4>> irradiance_time_integrals;
   double sampled_duration = 0.0;
+  std::size_t completed_samples = 0;
+  if (progress && !unique_cells.empty())
+    progress({OptimizationPhase::scoring, 0, race.samples.size()});
   for (const RaceSample& sample : race.samples) {
+    if (stop && stop()) throw std::runtime_error("Optimization stopped before scoring finished; no partial race totals saved");
     std::vector<Cell> batch;
     batch.reserve(unique_cells.size());
     for (const auto& [key, cell] : unique_cells) {
@@ -736,11 +770,14 @@ OptimizedLayout optimize_race_layout(
       integral[2] += cell.diffuse_sky_w_m2 * sample.duration_seconds;
       integral[3] += cell.scene_reflected_w_m2 * sample.duration_seconds;
     }
+    ++completed_samples;
+    if (progress) progress({OptimizationPhase::scoring, completed_samples, race.samples.size()});
   }
   for (ModuleCandidate& candidate : candidates) {
     for (const Cell& cell : candidate.cells) candidate.energy_wh += energy[cell_key(cell)];
   }
-  OptimizedLayout result = solve_module_packing(candidates, effective_settings);
+  OptimizedLayout result = solve_module_packing(candidates, effective_settings, progress, stop);
+  if (progress) progress({OptimizationPhase::finishing});
   if (sampled_duration > 0.0) {
     for (Cell& cell : result.layout.cells) {
       const auto found = irradiance_time_integrals.find(cell_key(cell));

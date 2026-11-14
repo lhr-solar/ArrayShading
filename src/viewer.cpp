@@ -16,12 +16,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <iomanip>
 #include <iostream>
 #include <optional>
@@ -165,6 +167,96 @@ struct Breakdown {
   float sky = 0.0f;
   float reflected = 0.0f;
 };
+
+struct RaceProgress {
+  using Clock = std::chrono::steady_clock;
+  std::mutex mutex;
+  std::optional<OptimizationProgress> update;
+  const Clock::time_point started_at = Clock::now();
+  Clock::time_point phase_started_at = started_at;
+  Clock::time_point last_sample_at = started_at;
+  std::atomic_bool stop_requested{false};
+
+  void publish(OptimizationProgress next) {
+    const auto now = Clock::now();
+    std::lock_guard lock(mutex);
+    if (!update || update->phase != next.phase) phase_started_at = now;
+    update = next;
+    last_sample_at = now;
+  }
+};
+
+std::string duration_label(double seconds) {
+  if (!std::isfinite(seconds) || seconds >= 360000.0) return "100+ hr";
+  const auto total = static_cast<int>(std::ceil(std::max(0.0, seconds)));
+  if (total >= 3600) return std::to_string(total / 3600) + " hr " +
+      std::to_string(total / 60 % 60) + " min";
+  if (total >= 60) return std::to_string(total / 60) + " min " +
+      std::to_string(total % 60) + " sec";
+  return std::to_string(total) + " sec";
+}
+
+void draw_race_progress(RaceProgress& progress) {
+  using Seconds = std::chrono::duration<double>;
+  std::optional<OptimizationProgress> update;
+  RaceProgress::Clock::time_point phase_start, last_sample;
+  {
+    std::lock_guard lock(progress.mutex);
+    update = progress.update;
+    phase_start = progress.phase_started_at;
+    last_sample = progress.last_sample_at;
+  }
+  const auto now = RaceProgress::Clock::now();
+  ImGui::Text("Elapsed: %s", duration_label(Seconds(now - progress.started_at).count()).c_str());
+  if (!update) {
+    ImGui::TextWrapped("Loading track and dated weather. Time left will appear once ray tracing starts.");
+    return;
+  }
+  switch (update->phase) {
+    case OptimizationPhase::candidates:
+      ImGui::TextWrapped("Generating and checking module placements...");
+      break;
+    case OptimizationPhase::scoring: {
+      const auto label = std::to_string(update->completed_samples) + " / " +
+                         std::to_string(update->total_samples) + " track samples";
+      ImGui::ProgressBar(static_cast<float>(update->completed_samples) /
+                         static_cast<float>(update->total_samples), {-1.0f, 0.0f}, label.c_str());
+      const double measured_seconds = Seconds(last_sample - phase_start).count();
+      if (update->completed_samples < 3 || measured_seconds <= 0) {
+        ImGui::TextUnformatted("Estimating ray-tracing time left...");
+      } else {
+        const double remaining = measured_seconds / static_cast<double>(update->completed_samples) *
+            static_cast<double>(update->total_samples - update->completed_samples);
+        ImGui::Text("Ray tracing left: ~%s", duration_label(remaining).c_str());
+      }
+      ImGui::TextDisabled("Layout packing follows ray tracing.");
+      break;
+    }
+    case OptimizationPhase::packing_setup:
+      ImGui::TextWrapped("Ray tracing complete. Building layout constraints...");
+      break;
+    case OptimizationPhase::solving: {
+      ImGui::TextWrapped("Packing modules: %s elapsed. No time cutoff or reliable finish estimate.",
+                         duration_label(Seconds(now - phase_start).count()).c_str());
+      if (update->best_electrical_wh >= 0.0)
+        ImGui::Text("Best feasible layout: %.1f Wh", update->best_electrical_wh);
+      if (update->relative_gap >= 0.0)
+        ImGui::Text("Gap to energy bound: %.2f%%", update->relative_gap * 100.0);
+      break;
+    }
+    case OptimizationPhase::area_tie_break:
+      ImGui::TextWrapped("Best energy found. Maximizing active area at that energy (%s elapsed).",
+                         duration_label(Seconds(now - phase_start).count()).c_str());
+      break;
+    case OptimizationPhase::module_tie_break:
+      ImGui::TextWrapped("Checking for more 2x3 modules at the same energy and area (%s elapsed).",
+                         duration_label(Seconds(now - phase_start).count()).c_str());
+      break;
+    case OptimizationPhase::finishing:
+      ImGui::TextWrapped("Preparing layout results...");
+      break;
+  }
+}
 
 GLuint compile_shader(GLenum type, const char* source) {
   const GLuint shader = glCreateShader(type);
@@ -606,11 +698,24 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
     std::optional<WeatherConditions> weather_conditions;
     std::future<WeatherConditions> weather_future;
     bool weather_request_running = false;
+    bool discard_weather_response = false;
     std::string weather_status = "Enter coordinates, then fetch current conditions";
-    struct RaceJob { OptimizedLayout optimized; RaceRun race; RaceConfig config; };
+    struct RaceJob {
+      OptimizedLayout optimized;
+      RaceRun race;
+      RaceConfig config;
+      double weather_latitude = 0.0;
+      double weather_longitude = 0.0;
+    };
     std::future<RaceJob> race_future;
+    std::shared_ptr<RaceProgress> race_progress;
+    struct StopOnExit {
+      std::shared_ptr<RaceProgress>& progress;
+      ~StopOnExit() { if (progress) progress->stop_requested = true; }
+    } stop_on_exit{race_progress};
     bool race_running = false;
     bool race_average = false;
+    bool reveal_race_panel = false;
     std::optional<RaceJob> race_result;
     std::optional<RaceConfig> race_config;
     std::string race_status;
@@ -740,6 +845,11 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
       if (race_running && race_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         try {
           race_result = race_future.get();
+          weather_latitude = race_result->weather_latitude;
+          weather_longitude = race_result->weather_longitude;
+          weather_conditions.reset();
+          discard_weather_response = weather_request_running;
+          weather_status = "Track coordinates loaded. Fetch current weather for a separate snapshot; the race already used dated weather.";
           cells = race_result->optimized.layout.cells;
           layout_summary = race_result->optimized.layout.summary;
           summary = {};
@@ -755,12 +865,14 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
           race_average = true;
           inputs_dirty = false;
           status = "Race-average cell irradiance";
+          reveal_race_panel = true;
           write_cell_csv(output_path, cells);
           auto report = output_path; report.replace_extension("race.json");
           write_optimized_race(report, race_result->config, race_result->race, race_result->optimized);
           race_status = race_result->optimized.status;
         } catch (const std::exception& error) { race_status = error.what(); }
         race_running = false;
+        race_progress.reset();
       }
       if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
         glfwSetWindowShouldClose(window, GLFW_TRUE);
@@ -769,20 +881,23 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
           weather_future.wait_for(std::chrono::seconds(0)) ==
               std::future_status::ready) {
         try {
-          weather_conditions = weather_future.get();
-          const WeatherConditions& conditions = *weather_conditions;
-          sun.dni_w_m2 = conditions.dni_w_m2;
-          sun.dhi_w_m2 = conditions.dhi_w_m2;
-          azimuth = wrapped_degrees(conditions.sun.azimuth_degrees -
-                                    vehicle_heading);
-          elevation = conditions.sun.elevation_degrees;
-          weather_status = "Applied " + conditions.observation_time_utc +
-                           " UTC; run simulation to refresh cells";
-          inputs_dirty = true;
+          auto conditions = weather_future.get();
+          if (!discard_weather_response) {
+            sun.dni_w_m2 = conditions.dni_w_m2;
+            sun.dhi_w_m2 = conditions.dhi_w_m2;
+            azimuth = wrapped_degrees(conditions.sun.azimuth_degrees -
+                                      vehicle_heading);
+            elevation = conditions.sun.elevation_degrees;
+            weather_status = "Applied " + conditions.observation_time_utc +
+                             " UTC; run simulation to refresh cells";
+            weather_conditions = std::move(conditions);
+            inputs_dirty = true;
+          }
         } catch (const std::exception& error) {
-          weather_status = error.what();
+          if (!discard_weather_response) weather_status = error.what();
         }
         weather_request_running = false;
+        discard_weather_response = false;
       }
 
       ImGui_ImplOpenGL3_NewFrame();
@@ -795,6 +910,10 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
           ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove |
           ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse;
       ImGui::Begin("Simulation controls", nullptr, panel_flags);
+      if (reveal_race_panel) {
+        ImGui::SetScrollY(0.0f);
+        reveal_race_panel = false;
+      }
 
       ImGui::TextColored({0.18f, 0.80f, 0.96f, 1.0f}, "SOLAR WHITTED");
       ImGui::SameLine();
@@ -812,6 +931,54 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
       }
       camera_routing.split = track_view;
       camera_routing.split_x = kPanelWidth + (io.DisplaySize.x - kPanelWidth) * 0.5;
+      if (race_progress) {
+        ImGui::SeparatorText("Race optimization");
+        draw_race_progress(*race_progress);
+        if (race_progress->stop_requested) ImGui::TextUnformatted("Stopping at the next safe point...");
+        else if (ImGui::Button("Stop optimization")) race_progress->stop_requested = true;
+      }
+      if (race_result) {
+        const auto& result = race_result->optimized;
+        ImGui::SeparatorText(race_running ? "Previous race result" : "Race result");
+        ImGui::TextWrapped("%s", result.status.c_str());
+        ImGui::Text("Electrical energy: %.1f Wh", result.electrical_energy_wh);
+        ImGui::Text("Average electrical power: %.1f W", result.mean_electrical_power_w);
+        ImGui::Text("Selected cells: %zu (%zu x 2x3, %zu x 1x3)",
+                    result.layout.cells.size(), result.layout.summary.two_by_three_modules,
+                    result.layout.summary.one_by_three_modules);
+        double active_area = 0;
+        for (const auto& cell : result.layout.cells) active_area += cell.active_area_m2;
+        ImGui::Text("Active area: %.3f / %.3f m2", active_area, race_result->config.max_active_area_m2);
+        ImGui::TextDisabled("Unused allowance: %.3f m2",
+                            std::max(0.0, race_result->config.max_active_area_m2 - active_area));
+        if (result.relative_gap >= 0) ImGui::Text("Energy bound gap: %.2f%%", result.relative_gap * 100.0);
+        else ImGui::TextUnformatted("Energy bound gap: unavailable");
+        if (!race_average) ImGui::TextDisabled("Cell colors currently show the snapshot run.");
+        if (ImGui::TreeNode("Race result details")) {
+          ImGui::Text("Optical energy: %.1f Wh", result.optical_energy_wh);
+          ImGui::Text("%.2f laps | %zu track samples", race_result->race.laps,
+                      race_result->race.samples.size());
+          ImGui::Text("Candidate modules: %zu", result.candidate_modules);
+          ImGui::TextWrapped("Race energy first, then active area, then 2x3 count. Optimality applies to the sampled placements.");
+          ImGui::TreePop();
+        }
+      } else {
+        ImGui::BeginChild("Summary", {0.0f, 188.0f}, true);
+        ImGui::TextDisabled("CURRENT RESULT");
+        ImGui::TextColored({0.98f, 0.78f, 0.24f, 1.0f}, "%s W/m2",
+                           fixed(summary.area_weighted_irradiance_w_m2, 1).c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("area weighted");
+        draw_label_value("Incident optical power",
+                         fixed(summary.incident_solar_power_w, 1) + " W");
+        draw_label_value("Selected cells", std::to_string(summary.cell_count));
+        draw_label_value("2x3 modules",
+                         std::to_string(layout_summary.two_by_three_modules));
+        draw_label_value("1x3 modules",
+                         std::to_string(layout_summary.one_by_three_modules));
+        draw_label_value("Active area", fixed(summary.active_area_m2, 3) + " m2");
+        ImGui::EndChild();
+      }
       if (track_view) {
         ImGui::Text("Track: %.2f km | %zu vertices", track_length_m / 1000.0, rendered_track.size());
         ImGui::Text("Elevation range: %.1f m (true scale)", track_relief_m);
@@ -885,22 +1052,6 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
         top_status = "Approved shell loaded. Cells will be generated only on this matched surface.";
       }
 
-      ImGui::BeginChild("Summary", {0.0f, 188.0f}, true);
-      ImGui::TextDisabled("CURRENT RESULT");
-      ImGui::TextColored({0.98f, 0.78f, 0.24f, 1.0f}, "%s W/m2",
-                         fixed(summary.area_weighted_irradiance_w_m2, 1).c_str());
-      ImGui::SameLine();
-      ImGui::TextDisabled("area weighted");
-      draw_label_value("Incident optical power",
-                       fixed(summary.incident_solar_power_w, 1) + " W");
-      draw_label_value("Selected cells", std::to_string(summary.cell_count));
-      draw_label_value("2x3 modules",
-                       std::to_string(layout_summary.two_by_three_modules));
-      draw_label_value("1x3 modules",
-                       std::to_string(layout_summary.one_by_three_modules));
-      draw_label_value("Active area", fixed(summary.active_area_m2, 3) + " m2");
-      ImGui::EndChild();
-
       ImGui::TextDisabled("TIMED TRACK LAYOUT OPTIMIZER");
       ImGui::TextWrapped("Config: %s", race_config_path.string().c_str());
       ImGui::BeginDisabled(race_running || car_loading);
@@ -915,7 +1066,6 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
         ImGui::InputDouble("Position step (m)", &race_config->position_step_m, 0, 0, "%.3f");
         ImGui::InputDouble("Angle step (deg)", &race_config->angle_step_degrees, 0, 0, "%.1f");
         ImGui::InputDouble("Track step (m)", &race_config->track_step_m, 0, 0, "%.1f");
-        ImGui::InputDouble("Packing solver limit (s)", &race_config->solver_time_limit_seconds, 0, 0, "%.0f");
         ImGui::InputDouble("Start offset on track (m)", &race_config->start_distance_m, 0, 0, "%.1f");
         if (ImGui::Button("Save race config")) {
           try { save_race_config(race_config_path, *race_config); race_status = "Race config saved"; }
@@ -923,41 +1073,40 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
         }
         ImGui::TextWrapped("Start offset 0 uses the supplied track origin; physical start/finish is not verified in the archive.");
         ImGui::BeginDisabled(!loaded_top);
-        if (ImGui::Button("OPTIMIZE RACE LAYOUT", {-1.0f, 36.0f})) {
+        if (ImGui::Button(race_running ? "OPTIMIZING..." : "OPTIMIZE RACE LAYOUT", {-1.0f, 36.0f})) {
           const auto config = *race_config;
           const auto trace_settings = settings;
           const auto top_snapshot = loaded_top;
           const auto car_snapshot = car;
-          race_future = std::async(std::launch::async, [&, config, trace_settings, top_snapshot, car_snapshot] {
+          auto progress = std::make_shared<RaceProgress>();
+          race_future = std::async(std::launch::async, [&, config, trace_settings, top_snapshot, car_snapshot, progress] {
             RaceJob job;
             job.config = config;
             const auto track = load_track(config.track_path);
             job.race = build_race_run(config, track);
+            // Match the reference point used by the race's dated weather query.
+            job.weather_latitude = track.points.front().latitude;
+            job.weather_longitude = track.points.front().longitude;
             job.optimized = optimize_race_layout(top_snapshot->scene,
                 top_snapshot->surface.mesh.bounds, car_snapshot->scene, grid,
-                top_snapshot->surface.region, job.race, trace_settings, optimization_settings(config));
+                top_snapshot->surface.region, job.race, trace_settings, optimization_settings(config),
+                [progress](OptimizationProgress update) { progress->publish(update); },
+                [progress] { return progress->stop_requested.load(); });
             return job;
           });
+          race_progress = std::move(progress);
           race_running = true;
           track_view = true;
           select_layout_tab = true;
-          race_status = "Fetching dated weather, scoring candidates, then packing. Scoring can be lengthy; the solver time limit applies only to packing.";
+          reveal_race_panel = true;
+          race_status.clear();
         }
         ImGui::EndDisabled();
+        if (!race_running && !loaded_top)
+          ImGui::TextWrapped("Browse for a top-shell STL and approve its alignment to enable optimization.");
       }
       ImGui::EndDisabled();
-      ImGui::TextWrapped("%s", race_status.c_str());
-      if (race_result) {
-        const auto& result = race_result->optimized;
-        ImGui::Text("Electrical energy: %.1f Wh", result.electrical_energy_wh);
-        ImGui::Text("Optical energy: %.1f Wh", result.optical_energy_wh);
-        ImGui::Text("Average electrical power: %.1f W", result.mean_electrical_power_w);
-        ImGui::Text("%.2f laps | %zu time/track samples", race_result->race.laps, race_result->race.samples.size());
-        ImGui::Text("Candidate modules: %zu", result.candidate_modules);
-        if (result.relative_gap >= 0) ImGui::Text("Energy bound gap: %.2f%%", result.relative_gap * 100.0);
-        else ImGui::TextUnformatted("Energy bound gap: unavailable");
-        ImGui::TextWrapped("Finite-candidate solution only; not a continuous global optimum. Cell colors: %s.", race_average ? "race average" : "instantaneous rerun");
-      }
+      if (!race_status.empty()) ImGui::TextWrapped("%s", race_status.c_str());
 
       ImGui::Spacing();
       ImGui::TextDisabled("OPEN-METEO LOCATION");

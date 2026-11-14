@@ -63,12 +63,31 @@ void strict_energy_tie_prefers_two_by_three() {
   solar::OptimizationSettings settings;
   settings.max_active_area_m2 = 0.10;
   const std::vector<solar::ModuleCandidate> candidates{
-      module(0.0f, 12.0, 2), module(1.0f, 12.0)};
+      module(-1.0f, 6.0), module(1.0f, 6.0), module(0.0f, 12.0, 2)};
   const auto result = solar::solve_module_packing(candidates, settings);
   require(std::abs(result.optical_energy_wh - 12.0) < 1.0e-6,
           "Tie-break changed the primary energy objective");
   require(result.layout.summary.two_by_three_modules == 1U,
           "Strict energy tie did not prefer the 2x3 grouping");
+}
+
+void energy_tie_prefers_more_active_area_over_two_by_three() {
+  solar::OptimizationSettings settings;
+  settings.max_active_area_m2 = 0.14;
+  const std::vector<solar::ModuleCandidate> candidates{
+      module(0.0f, 12.0, 2), module(-0.07f, 4.0), module(0.30f, 4.0), module(1.0f, 4.0)};
+  const auto result = solar::solve_module_packing(candidates, settings);
+  require(result.optical_energy_wh == 16.0 && result.layout.cells.size() == 9U,
+          "fixture must preserve the higher-energy layout when its filler fits");
+  // All three singles avoid each other but conflict with the double. One
+  // overlaps it along Y, allowing three distinct parallel footprints.
+  std::vector<solar::ModuleCandidate> tied{
+      module(0.0f, 12.0, 2), module(-0.07f, 4.0), module(0.20f, 4.0), module(0.064f, 4.0)};
+  for (auto& cell : tied.back().cells) cell.center.y += 0.256f;
+  const auto fuller = solar::solve_module_packing(tied, settings);
+  require(fuller.optical_energy_wh == 12.0 && fuller.layout.summary.one_by_three_modules == 3U &&
+              fuller.status == "Optimal",
+          "energy tie should use the most active area before preferring 2x3 modules");
 }
 
 void area_budget_is_enforced() {
@@ -99,6 +118,7 @@ void packing_matches_exhaustive_small_cases() {
     solar::OptimizationSettings settings;
     settings.max_active_area_m2 = 0.15 + static_cast<double>(random() % 5) * 0.05;
     double best_energy = -1;
+    double best_area = 0.0;
     std::size_t best_two_by_three = 0;
     for (unsigned mask = 0; mask < (1U << candidates.size()); ++mask) {
       double area = 0, energy = 0;
@@ -122,13 +142,16 @@ void packing_matches_exhaustive_small_cases() {
         }
       }
       if (!feasible || area > settings.max_active_area_m2) continue;
-      if (energy > best_energy || (energy == best_energy && twos > best_two_by_three)) {
-        best_energy = energy; best_two_by_three = twos;
+      if (energy > best_energy || (energy == best_energy &&
+          (area > best_area || (area == best_area && twos > best_two_by_three)))) {
+        best_energy = energy; best_area = area; best_two_by_three = twos;
       }
     }
     const auto result = solar::solve_module_packing(candidates, settings);
     require(std::abs(result.optical_energy_wh - best_energy) < 1.0e-6,
             "MILP energy differs from exhaustive feasible-subset enumeration");
+    require(std::abs(result.layout.cells.size() * static_cast<double>(0.0153f) - best_area) < 1.0e-12,
+            "MILP active area differs from exhaustive enumeration among energy-optimal layouts");
     require(result.layout.summary.two_by_three_modules == best_two_by_three,
             "MILP 2x3 tie-break differs from exhaustive enumeration");
   }
@@ -230,8 +253,20 @@ void timed_raytracing_and_packing_match_analytical_energy() {
   rays.worker_threads = 1;
   rays.hemisphere_samples = 8;
   rays.max_reflection_depth = 0;
+  std::vector<solar::OptimizationProgress> updates;
   const auto result = solar::optimize_race_layout(scene, mesh.bounds, scene,
-      grid, region, race, rays, settings);
+      grid, region, race, rays, settings,
+      [&](solar::OptimizationProgress update) { updates.push_back(update); });
+  using Phase = solar::OptimizationPhase;
+  require(updates.size() >= 7 && updates.front().phase == Phase::candidates &&
+          updates[4].phase == Phase::packing_setup && updates[5].phase == Phase::solving &&
+          updates[5].best_electrical_wh > 0 &&
+          updates.back().phase == Phase::finishing, "optimization reports phases and a feasible starting score");
+  for (std::size_t i = 0; i <= race.samples.size(); ++i)
+    require(updates[i + 1].phase == Phase::scoring &&
+            updates[i + 1].completed_samples == i &&
+            updates[i + 1].total_samples == race.samples.size(),
+            "scoring progress counts completed track samples");
   require(result.layout.cells.size() == 6, "integration should select six cells under area cap");
   const double expected = 675.0 * grid.active_area_m2 * 6.0 * 2.0;
   require(std::abs(result.optical_energy_wh - expected) < 0.001,
@@ -241,6 +276,17 @@ void timed_raytracing_and_packing_match_analytical_energy() {
   for (const auto& cell : result.layout.cells)
     require(std::abs(cell.direct_w_m2 - 675) < 0.001,
             "rendered cells should contain race-average irradiance, not final sample");
+}
+
+void stopped_packing_preserves_feasible_start() {
+  solar::OptimizationSettings settings;
+  settings.max_active_area_m2 = 0.1;
+  const std::vector<solar::ModuleCandidate> candidates{
+      module(0.0f, 10.0), module(0.07f, 9.0), module(-0.07f, 8.0), module(1.0f, 7.0)};
+  const auto result = solar::solve_module_packing(candidates, settings, {}, [] { return true; });
+  require(!result.proven_optimal && result.layout.cells.size() == 6 &&
+              std::abs(result.optical_energy_wh - 17.0) < 1.0e-6,
+          "manual stop keeps the non-overlapping, area-limited starting layout");
 }
 
 void unsupported_cells_cannot_turn_module_into_three_cell_fragment() {
@@ -279,6 +325,7 @@ int main() {
     packing_selects_best_compatible_set();
     energy_is_primary_over_module_count();
     strict_energy_tie_prefers_two_by_three();
+    energy_tie_prefers_more_active_area_over_two_by_three();
     area_budget_is_enforced();
     conflict_search_respects_nondefault_gap();
     packing_matches_exhaustive_small_cases();
@@ -286,6 +333,7 @@ int main() {
     exclusion_region_rejects_canopy_area();
     invalid_settings_are_rejected();
     timed_raytracing_and_packing_match_analytical_energy();
+    stopped_packing_preserves_feasible_start();
     unsupported_cells_cannot_turn_module_into_three_cell_fragment();
   } catch (const std::exception& error) {
     std::cerr << "optimizer test failure: " << error.what() << '\n';

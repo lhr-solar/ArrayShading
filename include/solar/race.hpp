@@ -23,7 +23,6 @@ struct RaceConfig {
   double track_step_m = 100.0;
   double position_step_m = 0.128;
   double angle_step_degrees = 15.0;
-  double solver_time_limit_seconds = 60.0;
 };
 
 struct TrackPoint {
