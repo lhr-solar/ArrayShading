@@ -682,7 +682,7 @@ GeneratedLayout pack_shell_perimeter_inward(
         if (skip_phase && row % 3 == phase) continue;
         for (int col = 0; col < grid_columns;) {
           const auto anchor = grid_point(col, row+1);
-          if (!remainder && from_rear(anchor.y) >= nose_start) break;
+          if (remainder != (from_rear(anchor.y) >= nose_start)) break;
           if (col+1 < grid_columns && place(anchor + Vec3{lattice_u*0.5f,0,0}, 0, 2, spacing)) col += 2;
           else { place(anchor, 0, 1, spacing); ++col; }
         }
@@ -695,7 +695,7 @@ GeneratedLayout pack_shell_perimeter_inward(
     if (std::abs(pitch_u-pitch_v) <= 1.0e-6f) {
       for (int row = 0; row < grid_rows; ++row) for (int col = 1; col+1 < grid_columns; ++col) {
         const auto anchor = grid_point(col, row);
-        if (!remainder && from_rear(anchor.y) >= nose_start) break;
+        if (remainder != (from_rear(anchor.y) >= nose_start)) break;
         place(anchor, kPi*0.5f, 1, spacing);
       }
     }
@@ -728,10 +728,9 @@ GeneratedLayout pack_shell_perimeter_inward(
       }
     }
   }
-  result = std::move(best_grid);
-  selected = std::move(best_placements);
   const float yaw_adjustment = static_cast<float>(std::min(settings.angle_step_degrees, 15.0)) * kPi / 180.0f;
-  const auto fill_contour = [&](float inset, std::uint32_t columns) {
+  const auto fill_contour = [&](float inset, std::uint32_t columns,
+                               float start_offset, int walk_direction, float spacing) {
     // Extract oriented edges of the inset footprint. Interior is on the left.
     // Scan from the rear, low X first, to seed the walk at the rear-left end.
     const float threshold = inset + step * 0.5f;
@@ -773,39 +772,60 @@ GeneratedLayout pack_shell_perimeter_inward(
           return loop[i] + (loop[(i+1)%loop.size()] - loop[i]) * std::clamp(f-static_cast<float>(i), 0.0f, 1.0f);
         };
         const float half_span = std::min(1.5f*pitch_v, perimeter*0.125f);
-        for (float s = 0; s < perimeter;) {
+        for (float traveled = 0; traveled < perimeter;) {
+          const float s = start_offset + walk_direction*traveled;
           const auto anchor = point_at(s);
-          if (from_rear(anchor.y) < nose_start) { s += step; continue; }
+          if (from_rear(anchor.y) < nose_start) { traveled += step; continue; }
           const Vec3 tangent = point_at(s+half_span) - point_at(s-half_span);
-          if (std::hypot(tangent.x,tangent.y) < step) { s += step; continue; }
+          if (std::hypot(tangent.x,tangent.y) < step) { traveled += step; continue; }
           const float heading = std::atan2(tangent.y,tangent.x);
           const Vec3 inward{-std::sin(heading), std::cos(heading), 0};
           bool placed = false;
           for (float nudge : {0.0f, 0.5f, 1.0f}) {
             for (float angle : {0.0f, -0.5f, 0.5f, -1.0f, 1.0f}) {
               const auto p = anchor + inward*(nudge*step);
-              if (from_rear(p.y) >= nose_start && place(p, heading - kPi*0.5f + angle*yaw_adjustment, columns)) {
+              if (from_rear(p.y) >= nose_start && place(p, heading - kPi*0.5f + angle*yaw_adjustment, columns, spacing)) {
                 placed = true; break;
               }
             }
             if (placed) break;
           }
-          s += placed ? 3*pitch_v : step;
+          traveled += placed ? 3*(pitch_v+spacing) : step;
         }
       }
     }
   };
   const float max_depth = *std::max_element(depth.begin(), depth.end());
-  for (float band = 0; band + grid.width_m * 0.5f < max_depth; band += 2*pitch_u) {
-    fill_contour(band + pitch_u * 0.5f + grid.width_m * 0.5f, 2);
-    fill_contour(band + grid.width_m * 0.5f, 1);
-    fill_contour(band + pitch_u + grid.width_m * 0.5f, 1);
+  GeneratedLayout best_nose = best_grid;
+  const auto fill_nose = [&](float start_offset, int direction, float spacing) {
+    // Each trial starts with exactly the same straight deck and side strips.
+    result = best_grid;
+    selected = best_placements;
+    for (float band = 0; band + grid.width_m*0.5f < max_depth; band += 2*(pitch_u+spacing)) {
+      fill_contour(band + (pitch_u+spacing)*0.5f + grid.width_m*0.5f, 2, start_offset, direction, spacing);
+      fill_contour(band + grid.width_m*0.5f, 1, start_offset, direction, spacing);
+      fill_contour(band + pitch_u + spacing + grid.width_m*0.5f, 1, start_offset, direction, spacing);
+    }
+    for (float inset = (grid.width_m+pitch_u)*0.5f; inset < max_depth; inset += pitch_u)
+      fill_contour(inset, 1, start_offset, direction, spacing);
+    fill_grid(best_x_shift, best_y_shift, best_spacing, 0, true);
+
+    // Sweep more closely spaced lanes for narrow residual nose pockets. Use
+    // the opposite traversal to avoid repeating the same greedy decisions.
+    for (float inset = grid.width_m*0.5f; inset < max_depth; inset += pitch_u*0.25f)
+      fill_contour(inset, 1, start_offset + pitch_v*0.5f, -direction, spacing);
+    if (result.cells.size() > best_nose.cells.size() ||
+        (result.cells.size() == best_nose.cells.size() &&
+         result.summary.two_by_three_modules > best_nose.summary.two_by_three_modules))
+      best_nose = std::move(result);
+  };
+  if (nose_start < bounds.extent().y) {
+    for (int direction : {1, -1}) {
+      fill_nose(0, direction, 0);
+      fill_nose(pitch_v*0.5f, direction, best_spacing);
+    }
   }
-  // Try staggered narrow contours after the main bands. Near a curve or a
-  // split in the footprint, a leftover pocket need not line up with a lane.
-  for (float inset = (grid.width_m + pitch_u)*0.5f; inset < max_depth; inset += pitch_u)
-    fill_contour(inset, 1);
-  fill_grid(best_x_shift, best_y_shift, best_spacing, 0, true);
+  result = std::move(best_nose);
   result.summary.individual_cells = result.cells.size();
   return result;
 }
