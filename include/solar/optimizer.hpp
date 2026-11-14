@@ -78,10 +78,10 @@ CellTrackProfiles sample_cell_track_profiles(
     const OptimizationProgressCallback& progress = {},
     const OptimizationStopCallback& stop = {});
 
-// Zone indices correspond to CellTrackProfiles::cells. Throws if the module
-// adjacency graph is disconnected or the requested split is impossible.
+// Zone indices correspond to CellTrackProfiles::cells. Each zone is connected
+// by local module neighbors in XY, independent of the physical packing gap.
 std::vector<std::size_t> group_track_profiles(
-    const CellTrackProfiles& profiles, std::size_t zone_count, float cell_gap_m);
+    const CellTrackProfiles& profiles, std::size_t zone_count);
 
 OptimizedLayout solve_module_packing(
     const std::vector<ModuleCandidate>& candidates,

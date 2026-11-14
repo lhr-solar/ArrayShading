@@ -407,11 +407,10 @@ std::vector<ModuleCandidate> generate_module_candidates(
 }
 
 std::vector<std::size_t> group_track_profiles(
-    const CellTrackProfiles& profiles, std::size_t zone_count, float cell_gap_m) {
+    const CellTrackProfiles& profiles, std::size_t zone_count) {
   if ((zone_count != 2 && zone_count != 3) || profiles.race.samples.empty() ||
-      profiles.irradiance_w_m2.size() != profiles.race.samples.size() ||
-      !std::isfinite(cell_gap_m) || cell_gap_m < 0)
-    throw std::invalid_argument("Invalid track profiles, zone count, or cell gap");
+      profiles.irradiance_w_m2.size() != profiles.race.samples.size())
+    throw std::invalid_argument("Invalid track profiles or zone count");
   std::map<std::uint32_t, std::size_t> module_index;
   std::vector<std::vector<std::size_t>> modules;
   for (std::size_t i = 0; i < profiles.cells.size(); ++i) {
@@ -439,37 +438,33 @@ std::vector<std::size_t> group_track_profiles(
       curves[i][t] /= static_cast<double>(modules[i].size());
     }
   }
-  const auto point_segment_distance = [](const Vec3& p, const Vec3& a, const Vec3& b) {
-    const double x = b.x - a.x, y = b.y - a.y;
-    const double len2 = x*x + y*y;
-    const double u = len2 > 0 ? std::clamp(((p.x-a.x)*x+(p.y-a.y)*y)/len2, 0.0, 1.0) : 0.0;
-    return std::hypot(p.x-a.x-u*x, p.y-a.y-u*y);
-  };
-  const auto nearby = [&](const Cell& a, const Cell& b) {
-    const auto ac = projected_corners(a), bc = projected_corners(b);
-    double minimum = std::numeric_limits<double>::infinity();
-    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) {
-      minimum = std::min(minimum, point_segment_distance(ac[i], bc[j], bc[(j+1)%4]));
-      minimum = std::min(minimum, point_segment_distance(bc[j], ac[i], ac[(i+1)%4]));
+  std::vector<std::array<double, 2>> centers(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    auto& [x, y] = centers[i];
+    for (auto cell : modules[i]) {
+      const auto& p = profiles.cells[cell].center;
+      if (!std::isfinite(p.x) || !std::isfinite(p.y))
+        throw std::invalid_argument("Invalid module position in track profile");
+      x += p.x; y += p.y;
     }
-    return minimum <= static_cast<double>(cell_gap_m) + 1.0e-5;
-  };
+    x /= modules[i].size(); y /= modules[i].size();
+  }
+  // Gabriel neighbors: the disc with the two centers as its diameter must
+  // not contain another module center. A hole in coverage doesn't block a
+  // link, but a module between them prevents a shortcut past it. The graph
+  // contains a Euclidean spanning tree, so gaps don't strand modules.
   std::vector<std::vector<std::size_t>> neighbors(n);
   for (std::size_t i = 0; i < n; ++i) for (std::size_t j = 0; j < i; ++j) {
-    bool adjacent = false;
-    for (auto a : modules[i]) { for (auto b : modules[j])
-      if (nearby(profiles.cells[a], profiles.cells[b])) { adjacent = true; break; }
-      if (adjacent) break;
+    const auto [ax, ay] = centers[i];
+    const auto [bx, by] = centers[j];
+    bool adjacent = true;
+    for (std::size_t k = 0; k < n; ++k) {
+      if (k == i || k == j) continue;
+      const auto [x, y] = centers[k];
+      if ((x-ax)*(x-bx) + (y-ay)*(y-by) < 0) { adjacent = false; break; }
     }
     if (adjacent) { neighbors[i].push_back(j); neighbors[j].push_back(i); }
   }
-  std::vector<bool> visited(n);
-  std::vector<std::size_t> stack{0}; visited[0] = true;
-  while (!stack.empty()) { const auto i = stack.back(); stack.pop_back();
-    for (auto j : neighbors[i]) if (!visited[j]) { visited[j] = true; stack.push_back(j); }
-  }
-  if (std::find(visited.begin(), visited.end(), false) != visited.end())
-    throw std::runtime_error("Packed modules form disconnected islands at the configured cell gap; contiguous zones cannot be formed");
   const auto difference = [&](const std::vector<double>& a, const std::vector<double>& b) {
     double sum = 0;
     for (std::size_t t = 0; t < count; ++t) {

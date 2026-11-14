@@ -275,12 +275,13 @@ void track_profiles_preserve_each_sample_and_cell() {
             "each sample must retain its own irradiance without accumulating previous samples");
 }
 
-void zone_grouping_follows_profiles_and_requires_connectivity() {
+void zone_grouping_bridges_gaps_without_skipping_the_middle() {
   solar::CellTrackProfiles profiles;
   for (int i = 0; i < 3; ++i) {
-    auto candidate = module(static_cast<float>(i) * 0.128f, 0);
+    auto candidate = module(0, 0);
     for (auto& cell : candidate.cells) {
       cell.module_id = static_cast<std::uint32_t>(i + 1);
+      cell.center.y += static_cast<float>(i);
       profiles.cells.push_back(cell);
     }
   }
@@ -288,16 +289,35 @@ void zone_grouping_follows_profiles_and_requires_connectivity() {
   profiles.race.samples = {sample, sample};
   profiles.irradiance_w_m2 = {{100, 100, 100, 110, 110, 110, 800, 800, 800},
                               {200, 200, 200, 210, 210, 210, 100, 100, 100}};
-  const auto two = solar::group_track_profiles(profiles, 2, 0.003f);
+  const auto two = solar::group_track_profiles(profiles, 2);
   require(two[0] == two[3] && two[3] != two[6],
-          "two-zone grouping should separate the distinct adjacent module profile");
-  const auto three = solar::group_track_profiles(profiles, 3, 0.003f);
+          "similar modules should join across empty space without requiring cell-edge contact");
+  const auto three = solar::group_track_profiles(profiles, 3);
   require(three[0] != three[3] && three[0] != three[6] && three[3] != three[6],
           "three zones should contain separate modules");
-  for (std::size_t i = 6; i < 9; ++i) profiles.cells[i].center.x += 1.0f;
-  try { (void)solar::group_track_profiles(profiles, 2, 0.003f); }
-  catch (const std::runtime_error&) { return; }
-  throw std::runtime_error("disconnected module islands must be reported");
+  profiles.irradiance_w_m2 = {{100, 100, 100, 800, 800, 800, 100, 100, 100},
+                              {200, 200, 200, 100, 100, 100, 200, 200, 200}};
+  const auto ends = solar::group_track_profiles(profiles, 2);
+  require(ends[0] != ends[6], "matching front and rear modules cannot jump past the intervening zone");
+}
+
+void zone_grouping_can_split_left_and_right() {
+  solar::CellTrackProfiles profiles;
+  for (int i = 0; i < 4; ++i) {
+    auto candidate = module(i < 2 ? -0.5f : 0.5f, 0);
+    for (auto& cell : candidate.cells) {
+      cell.module_id = static_cast<std::uint32_t>(i+1);
+      cell.center.y += (i % 2) * 0.7f;
+      profiles.cells.push_back(cell);
+    }
+  }
+  solar::RaceSample sample; sample.duration_seconds = 5;
+  profiles.race.samples = {sample, sample};
+  profiles.irradiance_w_m2 = {{100, 100, 100, 110, 110, 110, 800, 800, 800, 790, 790, 790},
+                              {800, 800, 800, 790, 790, 790, 100, 100, 100, 110, 110, 110}};
+  const auto zones = solar::group_track_profiles(profiles, 2);
+  require(zones[0] == zones[3] && zones[6] == zones[9] && zones[0] != zones[6],
+          "similar profiles can form coherent side-by-side zones");
 }
 
 void arbitrary_sampled_rotation_is_supported() {
@@ -461,7 +481,8 @@ int main() {
     shell_packing_is_deterministic_and_supported();
     perimeter_packing_follows_the_rounded_nose();
     track_profiles_preserve_each_sample_and_cell();
-    zone_grouping_follows_profiles_and_requires_connectivity();
+    zone_grouping_bridges_gaps_without_skipping_the_middle();
+    zone_grouping_can_split_left_and_right();
     exclusion_region_rejects_canopy_area();
     invalid_settings_are_rejected();
     timed_raytracing_and_packing_match_analytical_energy();

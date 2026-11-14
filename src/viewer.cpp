@@ -1143,7 +1143,7 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
         const std::string label = std::to_string(count) + " MPPT zones";
         if (ImGui::Button(label.c_str())) {
           try {
-            auto assignment = group_track_profiles(*track_profiles, static_cast<std::size_t>(count), grid.gap_m);
+            auto assignment = group_track_profiles(*track_profiles, static_cast<std::size_t>(count));
             const std::array<Vec3, 3> colors{{{0.06f, 0.72f, 0.95f}, {0.99f, 0.54f, 0.12f}, {0.68f, 0.39f, 0.91f}}};
             std::vector<RenderVertex> zone_vertices;
             zone_vertices.reserve(cells.size() * 6U);
@@ -1157,7 +1157,7 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
             rendered_cells = std::move(zone_vertices);
             upload_vertices(cells_vbo, rendered_cells);
             show_cells = true; show_cell_heat = true;
-            zone_status = "Contiguous irradiance-profile groups; not an electrical MPPT-loss calculation.";
+            zone_status = "Coherent irradiance-profile zones; empty gaps are allowed. No electrical MPPT losses modeled.";
           } catch (const std::exception& error) { zone_status = error.what(); }
         }
         if (count == 2) ImGui::SameLine();
