@@ -59,6 +59,30 @@ std::vector<ModuleCandidate> generate_module_candidates(
     const CellGrid& grid, const ShellRegion& region,
     const OptimizationSettings& settings);
 
+GeneratedLayout pack_shell_center_outward(
+    const TraceScene& placement_scene, const Bounds& bounds,
+    const TraceScene& complete_trace_scene, const CellGrid& grid,
+    const ShellRegion& region, const OptimizationSettings& settings);
+
+// Sample-major irradiance profiles: row k corresponds to race.samples[k],
+// and column i corresponds to cells[i]. Values are incident W/m².
+struct CellTrackProfiles {
+  std::vector<Cell> cells;
+  RaceRun race;
+  std::vector<std::vector<float>> irradiance_w_m2;
+};
+
+CellTrackProfiles sample_cell_track_profiles(
+    const std::vector<Cell>& cells, const TraceScene& scene,
+    const RaceRun& race, const SimulationSettings& settings,
+    const OptimizationProgressCallback& progress = {},
+    const OptimizationStopCallback& stop = {});
+
+// Zone indices correspond to CellTrackProfiles::cells. Throws if the module
+// adjacency graph is disconnected or the requested split is impossible.
+std::vector<std::size_t> group_track_profiles(
+    const CellTrackProfiles& profiles, std::size_t zone_count, float cell_gap_m);
+
 OptimizedLayout solve_module_packing(
     const std::vector<ModuleCandidate>& candidates,
     const OptimizationSettings& settings,

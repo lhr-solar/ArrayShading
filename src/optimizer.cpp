@@ -400,6 +400,195 @@ std::vector<ModuleCandidate> generate_module_candidates(
   return result;
 }
 
+std::vector<std::size_t> group_track_profiles(
+    const CellTrackProfiles& profiles, std::size_t zone_count, float cell_gap_m) {
+  if ((zone_count != 2 && zone_count != 3) || profiles.race.samples.empty() ||
+      profiles.irradiance_w_m2.size() != profiles.race.samples.size() ||
+      !std::isfinite(cell_gap_m) || cell_gap_m < 0)
+    throw std::invalid_argument("Invalid track profiles, zone count, or cell gap");
+  std::map<std::uint32_t, std::size_t> module_index;
+  std::vector<std::vector<std::size_t>> modules;
+  for (std::size_t i = 0; i < profiles.cells.size(); ++i) {
+    const auto id = profiles.cells[i].module_id;
+    if (!id) throw std::invalid_argument("Every cell must have a module ID");
+    const auto [it, inserted] = module_index.emplace(id, modules.size());
+    if (inserted) modules.emplace_back();
+    modules[it->second].push_back(i);
+  }
+  if (modules.size() < zone_count) throw std::invalid_argument("Not enough modules for the requested zones");
+  const std::size_t n = modules.size(), count = profiles.race.samples.size();
+  std::vector<std::vector<double>> curves(n, std::vector<double>(count));
+  double total_duration = 0;
+  for (std::size_t t = 0; t < count; ++t) {
+    const auto dt = profiles.race.samples[t].duration_seconds;
+    if (!(dt > 0) || !std::isfinite(dt) || profiles.irradiance_w_m2[t].size() != profiles.cells.size())
+      throw std::invalid_argument("Invalid track profile dimensions or sample duration");
+    total_duration += dt;
+    for (std::size_t i = 0; i < n; ++i) {
+      for (const auto c : modules[i]) {
+        const auto value = profiles.irradiance_w_m2[t][c];
+        if (!std::isfinite(value) || value < 0) throw std::invalid_argument("Invalid irradiance in track profile");
+        curves[i][t] += value;
+      }
+      curves[i][t] /= static_cast<double>(modules[i].size());
+    }
+  }
+  const auto point_segment_distance = [](const Vec3& p, const Vec3& a, const Vec3& b) {
+    const double x = b.x - a.x, y = b.y - a.y;
+    const double len2 = x*x + y*y;
+    const double u = len2 > 0 ? std::clamp(((p.x-a.x)*x+(p.y-a.y)*y)/len2, 0.0, 1.0) : 0.0;
+    return std::hypot(p.x-a.x-u*x, p.y-a.y-u*y);
+  };
+  const auto nearby = [&](const Cell& a, const Cell& b) {
+    const auto ac = projected_corners(a), bc = projected_corners(b);
+    double minimum = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) {
+      minimum = std::min(minimum, point_segment_distance(ac[i], bc[j], bc[(j+1)%4]));
+      minimum = std::min(minimum, point_segment_distance(bc[j], ac[i], ac[(i+1)%4]));
+    }
+    return minimum <= static_cast<double>(cell_gap_m) + 1.0e-5;
+  };
+  std::vector<std::vector<std::size_t>> neighbors(n);
+  for (std::size_t i = 0; i < n; ++i) for (std::size_t j = 0; j < i; ++j) {
+    bool adjacent = false;
+    for (auto a : modules[i]) { for (auto b : modules[j])
+      if (nearby(profiles.cells[a], profiles.cells[b])) { adjacent = true; break; }
+      if (adjacent) break;
+    }
+    if (adjacent) { neighbors[i].push_back(j); neighbors[j].push_back(i); }
+  }
+  std::vector<bool> visited(n);
+  std::vector<std::size_t> stack{0}; visited[0] = true;
+  while (!stack.empty()) { const auto i = stack.back(); stack.pop_back();
+    for (auto j : neighbors[i]) if (!visited[j]) { visited[j] = true; stack.push_back(j); }
+  }
+  if (std::find(visited.begin(), visited.end(), false) != visited.end())
+    throw std::runtime_error("Packed modules form disconnected islands at the configured cell gap; contiguous zones cannot be formed");
+  const auto difference = [&](const std::vector<double>& a, const std::vector<double>& b) {
+    double sum = 0;
+    for (std::size_t t = 0; t < count; ++t) {
+      const double d = a[t] - b[t];
+      sum += profiles.race.samples[t].duration_seconds * d*d;
+    }
+    return sum / total_duration;
+  };
+  const auto unassigned = std::numeric_limits<std::size_t>::max();
+  std::vector<std::size_t> assignments(n, unassigned), seeds{0};
+  assignments[0] = 0;
+  while (seeds.size() < zone_count) {
+    std::size_t best = unassigned; double best_distance = -1;
+    for (std::size_t i = 0; i < n; ++i) if (assignments[i] == unassigned) {
+      double nearest = std::numeric_limits<double>::infinity();
+      for (auto seed : seeds) nearest = std::min(nearest, difference(curves[i], curves[seed]));
+      if (nearest > best_distance) { best_distance = nearest; best = i; }
+    }
+    assignments[best] = seeds.size(); seeds.push_back(best);
+  }
+  std::vector<std::vector<double>> means(zone_count, std::vector<double>(count));
+  std::vector<std::size_t> zone_cells(zone_count);
+  for (std::size_t z = 0; z < zone_count; ++z) { means[z] = curves[seeds[z]]; zone_cells[z] = modules[seeds[z]].size(); }
+  for (std::size_t remaining = n - zone_count; remaining; --remaining) {
+    std::size_t best = unassigned, best_zone = unassigned; double cost = std::numeric_limits<double>::infinity();
+    for (std::size_t i = 0; i < n; ++i) if (assignments[i] == unassigned)
+      for (auto j : neighbors[i]) if (assignments[j] != unassigned) {
+        const auto z = assignments[j];
+        const auto value = difference(curves[i], means[z]);
+        if (value < cost) { cost = value; best = i; best_zone = z; }
+      }
+    if (best == unassigned) throw std::runtime_error("Unable to grow contiguous zones");
+    assignments[best] = best_zone;
+    const auto old_count = zone_cells[best_zone], added = modules[best].size();
+    for (std::size_t t = 0; t < count; ++t)
+      means[best_zone][t] = (means[best_zone][t]*old_count + curves[best][t]*added) / (old_count + added);
+    zone_cells[best_zone] += added;
+  }
+  std::vector<std::size_t> result(profiles.cells.size());
+  for (std::size_t i = 0; i < n; ++i) for (auto cell : modules[i]) result[cell] = assignments[i];
+  return result;
+}
+
+CellTrackProfiles sample_cell_track_profiles(
+    const std::vector<Cell>& cells, const TraceScene& scene,
+    const RaceRun& race, const SimulationSettings& settings,
+    const OptimizationProgressCallback& progress,
+    const OptimizationStopCallback& stop) {
+  if (cells.empty() || race.samples.empty())
+    throw std::invalid_argument("Track profiles require cells and race samples");
+  CellTrackProfiles result;
+  result.cells = cells;
+  result.race = race;
+  result.irradiance_w_m2.reserve(race.samples.size());
+  std::vector<Cell> batch = cells;
+  if (progress) progress({OptimizationPhase::scoring, 0, race.samples.size()});
+  for (const auto& sample : race.samples) {
+    if (!std::isfinite(sample.duration_seconds) || sample.duration_seconds <= 0.0)
+      throw std::invalid_argument("Track sample duration must be finite and positive");
+    if (stop && stop()) throw std::runtime_error("Track profiling stopped; no partial profiles retained");
+    simulate_cells(batch, scene, sample.sun, settings);
+    auto& row = result.irradiance_w_m2.emplace_back();
+    row.reserve(batch.size());
+    for (const auto& cell : batch) row.push_back(cell.total_w_m2());
+    if (progress) progress({OptimizationPhase::scoring, result.irradiance_w_m2.size(), race.samples.size()});
+  }
+  return result;
+}
+
+GeneratedLayout pack_shell_center_outward(
+    const TraceScene& placement_scene, const Bounds& bounds,
+    const TraceScene& complete_trace_scene, const CellGrid& grid,
+    const ShellRegion& region, const OptimizationSettings& settings) {
+  auto placement_settings = settings;
+  // This is a geometric full-shell preview, not the area-limited race solver.
+  placement_settings.max_active_area_m2 = std::numeric_limits<double>::max();
+  auto candidates = generate_module_candidates(placement_scene, bounds, grid,
+                                                region, placement_settings);
+  const Vec3 center = bounds.center();
+  const auto distance_squared = [&](const ModuleCandidate& module) {
+    double x = 0, y = 0;
+    for (const auto& cell : module.cells) { x += cell.center.x; y += cell.center.y; }
+    x = x / module.cells.size() - center.x;
+    y = y / module.cells.size() - center.y;
+    return x * x + y * y;
+  };
+  std::stable_sort(candidates.begin(), candidates.end(), [&](const auto& a, const auto& b) {
+    if (a.cells.size() != b.cells.size()) return a.cells.size() > b.cells.size();
+    return distance_squared(a) < distance_squared(b);
+  });
+  GeneratedLayout result;
+  std::vector<ModuleCandidate> selected;
+  for (auto& candidate : candidates) {
+    bool valid = true;
+    for (auto& cell : candidate.cells) {
+      if (!conform_shell_cell(cell, placement_scene, complete_trace_scene, grid)) {
+        valid = false;
+        break;
+      }
+    }
+    if (!valid) continue;
+    for (std::size_t i = 0; i < candidate.cells.size() && valid; ++i)
+      for (std::size_t j = 0; j < i; ++j)
+        if (overlaps(candidate.cells[i], candidate.cells[j], grid.gap_m)) { valid = false; break; }
+    if (!valid) continue;
+    for (const auto& prior : selected)
+      if (modules_conflict(candidate, prior, grid.gap_m)) { valid = false; break; }
+    if (!valid) continue;
+    const auto columns = candidate.cells.size() == 6 ? 2U : 1U;
+    const auto id = static_cast<std::uint32_t>(selected.size() + 1);
+    for (std::size_t i = 0; i < candidate.cells.size(); ++i) {
+      auto cell = candidate.cells[i];
+      cell.module_id = id; cell.module_rows = 3; cell.module_columns = columns;
+      cell.row = static_cast<std::uint32_t>(i / columns);
+      cell.column = static_cast<std::uint32_t>(i % columns);
+      result.cells.push_back(cell);
+    }
+    if (columns == 2) ++result.summary.two_by_three_modules;
+    else ++result.summary.one_by_three_modules;
+    selected.push_back(std::move(candidate));
+  }
+  result.summary.individual_cells = result.cells.size();
+  return result;
+}
+
 OptimizedLayout solve_module_packing(
     const std::vector<ModuleCandidate>& candidates,
     const OptimizationSettings& settings,

@@ -726,6 +726,18 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
     };
     std::future<CarLoad> car_future;
     bool car_loading = false;
+    std::future<GeneratedLayout> packing_future;
+    bool packing_running = false;
+    std::string packing_status;
+    bool packed_layout = false;
+    std::optional<CellTrackProfiles> track_profiles;
+    std::vector<std::size_t> zone_assignments;
+    int zone_display = 0;
+    std::string zone_status;
+    std::future<CellTrackProfiles> profiles_future;
+    bool profiles_running = false;
+    std::string profiles_status;
+    auto profiles_done = std::make_shared<std::atomic_size_t>(0);
     std::string car_status;
     char top_shell_path[4096]{};
     std::shared_ptr<LoadedTopShell> loaded_top;
@@ -738,6 +750,10 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
       pending_top.reset();
       rendered_top.clear();
       race_result.reset();
+      packed_layout = false;
+      track_profiles.reset();
+      zone_assignments.clear(); zone_display = 0; zone_status.clear();
+      profiles_status.clear();
       cells.clear(); summary = {}; layout_summary = {};
       rendered_cells.clear(); rendered_outlines.clear();
       upload_vertices(cells_vbo, rendered_cells);
@@ -804,6 +820,41 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
 
     while (!glfwWindowShouldClose(window)) {
       glfwPollEvents();
+      if (packing_running && packing_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        try {
+          auto packed = packing_future.get();
+          race_result.reset();
+          cells = std::move(packed.cells);
+          packed_layout = !cells.empty();
+          track_profiles.reset();
+          zone_assignments.clear(); zone_display = 0; zone_status.clear();
+          profiles_status.clear();
+          layout_summary = packed.summary;
+          summary = {};
+          summary.cell_count = cells.size();
+          for (const auto& cell : cells) summary.active_area_m2 += cell.active_area_m2;
+          rendered_cells = cell_vertices(cells);
+          rendered_outlines = cell_outlines(cells);
+          upload_vertices(cells_vbo, rendered_cells);
+          upload_vertices(outlines_vbo, rendered_outlines);
+          breakdown = {};
+          race_average = false;
+          show_cells = true;
+          show_cell_heat = false;
+          packing_status = "Shell packed. Cell outlines show the layout; no irradiance has been calculated.";
+          status = "Geometric layout only; run simulation for irradiance";
+        } catch (const std::exception& error) { packing_status = error.what(); }
+        packing_running = false;
+      }
+      if (profiles_running && profiles_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        try {
+          track_profiles = profiles_future.get();
+          profiles_status = "Track profiles ready: " + std::to_string(track_profiles->cells.size()) +
+              " cells, " + std::to_string(track_profiles->race.samples.size()) +
+              " samples. Retained in memory for zone grouping.";
+        } catch (const std::exception& error) { profiles_status = error.what(); }
+        profiles_running = false;
+      }
       if (car_loading && car_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         try {
           auto replacement = car_future.get();
@@ -845,6 +896,10 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
       if (race_running && race_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         try {
           race_result = race_future.get();
+          packed_layout = false;
+          track_profiles.reset();
+          zone_assignments.clear(); zone_display = 0; zone_status.clear();
+          profiles_status.clear();
           weather_latitude = race_result->weather_latitude;
           weather_longitude = race_result->weather_longitude;
           weather_conditions.reset();
@@ -983,7 +1038,7 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
 
       ImGui::TextDisabled("LOCAL GEOMETRY FILES");
       ImGui::TextWrapped("Full car: %s", car_path.string().c_str());
-      ImGui::BeginDisabled(race_running || car_loading);
+      ImGui::BeginDisabled(race_running || car_loading || packing_running || profiles_running);
 #ifdef _WIN32
       if (ImGui::Button("Browse full-car STL")) {
         const auto selected = browse_stl(L"Select the full-car or aero assembly STL");
@@ -1037,7 +1092,7 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
             checked_top->surface.max_alignment_error_m * 1000.0);
         ImGui::TextWrapped("Unmatched shell regions are excluded from placement.");
       }
-      if (pending_top && !loaded_top && !race_running && !car_loading && ImGui::Button("Approve validated shell alignment")) {
+      if (pending_top && !loaded_top && !race_running && !car_loading && !packing_running && !profiles_running && ImGui::Button("Approve validated shell alignment")) {
         loaded_top = pending_top;
         rendered_top.clear();
         for (const auto& point : loaded_top->surface.mesh.vertices)
@@ -1046,9 +1101,79 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
         top_status = "Approved shell loaded. Cells will be generated only on this matched surface.";
       }
 
+      ImGui::BeginDisabled(!loaded_top || !race_config || race_running || car_loading || packing_running || profiles_running);
+      if (ImGui::Button(packing_running ? "PACKING SHELL..." : "PACK FULL TOP SHELL", {-1.0f, 36.0f})) {
+        const auto top_snapshot = loaded_top;
+        const auto car_snapshot = car;
+        const auto grid_snapshot = grid;
+        const auto packing_settings = optimization_settings(*race_config);
+        packing_future = std::async(std::launch::async, [top_snapshot, car_snapshot, grid_snapshot, packing_settings] {
+          return pack_shell_center_outward(top_snapshot->scene, top_snapshot->surface.mesh.bounds,
+              car_snapshot->scene, grid_snapshot, top_snapshot->surface.region, packing_settings);
+        });
+        packing_running = true;
+        packing_status = "Packing 2x3 modules, then 1x3 modules from the shell center outward...";
+      }
+      ImGui::EndDisabled();
+      if (!packing_status.empty()) ImGui::TextWrapped("%s", packing_status.c_str());
+      ImGui::BeginDisabled(!packed_layout || !race_config || race_running || car_loading || packing_running || profiles_running);
+      if (ImGui::Button(profiles_running ? "SAMPLING TRACK..." : "SAMPLE PACKED CELLS ON TRACK", {-1.0f, 36.0f})) {
+        const auto cell_snapshot = cells;
+        const auto car_snapshot = car;
+        const auto config_snapshot = *race_config;
+        const auto settings_snapshot = settings;
+        const auto done = profiles_done;
+        done->store(0);
+        track_profiles.reset();
+        zone_assignments.clear(); zone_display = 0; zone_status.clear();
+        profiles_future = std::async(std::launch::async, [cell_snapshot, car_snapshot, config_snapshot, settings_snapshot, done] {
+          const auto track = load_track(config_snapshot.track_path);
+          const auto race = build_race_run(config_snapshot, track);
+          return sample_cell_track_profiles(cell_snapshot, car_snapshot->scene, race, settings_snapshot,
+              [done](OptimizationProgress update) { done->store(update.completed_samples); });
+        });
+        profiles_running = true;
+        profiles_status = "Loading track and weather, then sampling cells...";
+      }
+      ImGui::EndDisabled();
+      if (profiles_running) ImGui::Text("Track samples completed: %zu", profiles_done->load());
+      if (!profiles_status.empty()) ImGui::TextWrapped("%s", profiles_status.c_str());
+      ImGui::BeginDisabled(!track_profiles || profiles_running || packing_running || race_running || car_loading);
+      for (int count : {2, 3}) {
+        const std::string label = std::to_string(count) + " MPPT zones";
+        if (ImGui::Button(label.c_str())) {
+          try {
+            auto assignment = group_track_profiles(*track_profiles, static_cast<std::size_t>(count), grid.gap_m);
+            const std::array<Vec3, 3> colors{{{0.06f, 0.72f, 0.95f}, {0.99f, 0.54f, 0.12f}, {0.68f, 0.39f, 0.91f}}};
+            std::vector<RenderVertex> zone_vertices;
+            zone_vertices.reserve(cells.size() * 6U);
+            for (std::size_t i = 0; i < cells.size(); ++i) {
+              const auto corners = cell_corners(cells[i]);
+              for (int corner : {0, 1, 2, 0, 2, 3})
+                zone_vertices.push_back({corners[static_cast<std::size_t>(corner)], colors[assignment[i]]});
+            }
+            zone_assignments = std::move(assignment);
+            zone_display = count;
+            rendered_cells = std::move(zone_vertices);
+            upload_vertices(cells_vbo, rendered_cells);
+            show_cells = true; show_cell_heat = true;
+            zone_status = "Contiguous irradiance-profile groups; not an electrical MPPT-loss calculation.";
+          } catch (const std::exception& error) { zone_status = error.what(); }
+        }
+        if (count == 2) ImGui::SameLine();
+      }
+      ImGui::EndDisabled();
+      if (zone_display) {
+        ImGui::Text("Displayed: %d zones", zone_display);
+        ImGui::TextColored({0.06f, 0.72f, 0.95f, 1}, "Zone 1"); ImGui::SameLine();
+        ImGui::TextColored({0.99f, 0.54f, 0.12f, 1}, "Zone 2");
+        if (zone_display == 3) { ImGui::SameLine(); ImGui::TextColored({0.68f, 0.39f, 0.91f, 1}, "Zone 3"); }
+      }
+      if (!zone_status.empty()) ImGui::TextWrapped("%s", zone_status.c_str());
+
       ImGui::TextDisabled("TIMED TRACK LAYOUT OPTIMIZER");
       ImGui::TextWrapped("Config: %s", race_config_path.string().c_str());
-      ImGui::BeginDisabled(race_running || car_loading);
+      ImGui::BeginDisabled(race_running || car_loading || packing_running || profiles_running);
       if (ImGui::Button("Reload race config")) {
         try { race_config = load_race_config(race_config_path); race_status.clear(); load_track_view(); }
         catch (const std::exception& error) { race_config.reset(); race_status = error.what(); }
@@ -1190,12 +1315,13 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
       else
         ImGui::TextColored({0.35f, 0.80f, 0.55f, 1.0f}, "%s", status.c_str());
 
-      ImGui::BeginDisabled(race_running || car_loading);
+      ImGui::BeginDisabled(race_running || car_loading || packing_running || profiles_running);
       if (ImGui::Button("RUN SIMULATION", {-1.0f, 42.0f})) {
         const auto start = std::chrono::steady_clock::now();
         summary = simulate_cells(cells, car->scene, sun, settings);
         breakdown = calculate_breakdown(cells);
         rendered_cells = cell_vertices(cells);
+        zone_display = 0;
         rendered_outlines = cell_outlines(cells);
         upload_vertices(cells_vbo, rendered_cells);
         upload_vertices(outlines_vbo, rendered_outlines);

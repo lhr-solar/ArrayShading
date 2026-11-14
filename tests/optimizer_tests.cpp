@@ -172,6 +172,85 @@ solar::TriangleMesh make_flat_mesh() {
   return mesh;
 }
 
+void shell_packing_is_deterministic_and_supported() {
+  auto mesh = make_flat_mesh();
+  solar::TraceScene scene(mesh);
+  solar::CellGrid grid;
+  solar::ShellRegion region;
+  region.minimum = {-1, -1, 0}; region.maximum = {1, 1, 1};
+  region.use_canopy_exclusion = false;
+  solar::OptimizationSettings settings;
+  settings.position_step_m = 0.256;
+  settings.angle_step_degrees = 90;
+  settings.max_active_area_m2 = 0.01;  // Full-shell preview ignores this cap.
+  const auto a = solar::pack_shell_center_outward(scene, mesh.bounds, scene, grid, region, settings);
+  const auto b = solar::pack_shell_center_outward(scene, mesh.bounds, scene, grid, region, settings);
+  require(!a.cells.empty() && a.cells.size() == b.cells.size(),
+          "full-shell packing must produce a deterministic layout independent of the race area cap");
+  require(a.summary.two_by_three_modules > 0 &&
+          a.summary.individual_cells == a.cells.size(), "packing summary must count modules and cells");
+  for (std::size_t i = 0; i < a.cells.size(); ++i) {
+    require(a.cells[i].center.x == b.cells[i].center.x && a.cells[i].center.y == b.cells[i].center.y,
+            "packing positions must be deterministic");
+    require(a.cells[i].module_rows == 3 && (a.cells[i].module_columns == 1 || a.cells[i].module_columns == 2),
+            "packing must retain complete module metadata");
+  }
+}
+
+void track_profiles_preserve_each_sample_and_cell() {
+  auto mesh = make_flat_mesh();
+  solar::TraceScene scene(mesh);
+  auto cells = module(0, 0).cells;
+  for (auto& cell : cells) cell.center.z = 0.501f;
+  solar::RaceRun race;
+  solar::RaceSample sample;
+  sample.duration_seconds = 10;
+  sample.sun.direction_to_sun = {0, 0, 1};
+  sample.sun.dni_w_m2 = 900;
+  sample.sun.dhi_w_m2 = 0;
+  race.samples.push_back(sample);
+  sample.duration_seconds = 20;
+  sample.sun.dni_w_m2 = 450;
+  race.samples.push_back(sample);
+  solar::SimulationSettings settings;
+  settings.worker_threads = 1;
+  settings.hemisphere_samples = 8;
+  settings.max_reflection_depth = 0;
+  const auto profiles = solar::sample_cell_track_profiles(cells, scene, race, settings);
+  require(profiles.cells.size() == 3 && profiles.irradiance_w_m2.size() == 2 &&
+          profiles.race.samples[1].duration_seconds == 20,
+          "track profiles must preserve cell order and sample metadata");
+  for (std::size_t i = 0; i < cells.size(); ++i)
+    require(std::abs(profiles.irradiance_w_m2[0][i] - 900) < 0.01 &&
+            std::abs(profiles.irradiance_w_m2[1][i] - 450) < 0.01,
+            "each sample must retain its own irradiance without accumulating previous samples");
+}
+
+void zone_grouping_follows_profiles_and_requires_connectivity() {
+  solar::CellTrackProfiles profiles;
+  for (int i = 0; i < 3; ++i) {
+    auto candidate = module(static_cast<float>(i) * 0.128f, 0);
+    for (auto& cell : candidate.cells) {
+      cell.module_id = static_cast<std::uint32_t>(i + 1);
+      profiles.cells.push_back(cell);
+    }
+  }
+  solar::RaceSample sample; sample.duration_seconds = 5;
+  profiles.race.samples = {sample, sample};
+  profiles.irradiance_w_m2 = {{100, 100, 100, 110, 110, 110, 800, 800, 800},
+                              {200, 200, 200, 210, 210, 210, 100, 100, 100}};
+  const auto two = solar::group_track_profiles(profiles, 2, 0.003f);
+  require(two[0] == two[3] && two[3] != two[6],
+          "two-zone grouping should separate the distinct adjacent module profile");
+  const auto three = solar::group_track_profiles(profiles, 3, 0.003f);
+  require(three[0] != three[3] && three[0] != three[6] && three[3] != three[6],
+          "three zones should contain separate modules");
+  for (std::size_t i = 6; i < 9; ++i) profiles.cells[i].center.x += 1.0f;
+  try { (void)solar::group_track_profiles(profiles, 2, 0.003f); }
+  catch (const std::runtime_error&) { return; }
+  throw std::runtime_error("disconnected module islands must be reported");
+}
+
 void arbitrary_sampled_rotation_is_supported() {
   auto mesh = make_flat_mesh();
   solar::TraceScene scene(mesh);
@@ -330,6 +409,9 @@ int main() {
     conflict_search_respects_nondefault_gap();
     packing_matches_exhaustive_small_cases();
     arbitrary_sampled_rotation_is_supported();
+    shell_packing_is_deterministic_and_supported();
+    track_profiles_preserve_each_sample_and_cell();
+    zone_grouping_follows_profiles_and_requires_connectivity();
     exclusion_region_rejects_canopy_area();
     invalid_settings_are_rejected();
     timed_raytracing_and_packing_match_analytical_energy();
