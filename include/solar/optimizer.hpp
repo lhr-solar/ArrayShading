@@ -59,7 +59,7 @@ std::vector<ModuleCandidate> generate_module_candidates(
     const CellGrid& grid, const ShellRegion& region,
     const OptimizationSettings& settings);
 
-GeneratedLayout pack_shell_center_outward(
+GeneratedLayout pack_shell_perimeter_inward(
     const TraceScene& placement_scene, const Bounds& bounds,
     const TraceScene& complete_trace_scene, const CellGrid& grid,
     const ShellRegion& region, const OptimizationSettings& settings);

@@ -51,7 +51,8 @@ bool polygon_intersects_box(std::array<Vec3, 4> polygon, const Vec3& minimum,
 
 std::optional<Cell> supported_cell(const TraceScene& scene, float x, float y,
                                    float start_z, const CellGrid& grid,
-                                   const ShellRegion& region, float yaw) {
+                                   const ShellRegion& region, float yaw,
+                                   bool follow_xy_heading = false) {
   const auto hit = top_hit(scene, x, y, start_z);
   if (!hit || !in_bounds(hit->point, region.minimum, region.maximum) ||
       (region.use_canopy_exclusion &&
@@ -64,8 +65,13 @@ std::optional<Cell> supported_cell(const TraceScene& scene, float x, float y,
   const auto [base_u, base_v] = tangent_axes(hit->normal);
   const float c = std::cos(yaw);
   const float s = std::sin(yaw);
-  const Vec3 u = normalized(base_u * c + base_v * s);
-  const Vec3 v = normalized(-base_u * s + base_v * c);
+  Vec3 u = normalized(base_u * c + base_v * s);
+  Vec3 v = normalized(-base_u * s + base_v * c);
+  if (follow_xy_heading) {
+    // Lift the contour's XY heading into the cell's local tangent plane.
+    v = normalized({-s, c, (hit->normal.x * s - hit->normal.y * c) / hit->normal.z});
+    u = normalized(cross(v, hit->normal));
+  }
   std::array<Hit, 9> supports{};
   float maximum_signed_support_deviation = 0.0f;
   for (int vi = -1; vi <= 1; ++vi) {
@@ -533,49 +539,72 @@ CellTrackProfiles sample_cell_track_profiles(
   return result;
 }
 
-GeneratedLayout pack_shell_center_outward(
+GeneratedLayout pack_shell_perimeter_inward(
     const TraceScene& placement_scene, const Bounds& bounds,
     const TraceScene& complete_trace_scene, const CellGrid& grid,
     const ShellRegion& region, const OptimizationSettings& settings) {
-  auto placement_settings = settings;
-  // This is a geometric full-shell preview, not the area-limited race solver.
-  placement_settings.max_active_area_m2 = std::numeric_limits<double>::max();
-  auto candidates = generate_module_candidates(placement_scene, bounds, grid,
-                                                region, placement_settings);
-  const Vec3 center = bounds.center();
-  const auto distance_squared = [&](const ModuleCandidate& module) {
-    double x = 0, y = 0;
-    for (const auto& cell : module.cells) { x += cell.center.x; y += cell.center.y; }
-    x = x / module.cells.size() - center.x;
-    y = y / module.cells.size() - center.y;
-    return x * x + y * y;
-  };
-  std::stable_sort(candidates.begin(), candidates.end(), [&](const auto& a, const auto& b) {
-    if (a.cells.size() != b.cells.size()) return a.cells.size() > b.cells.size();
-    return distance_squared(a) < distance_squared(b);
-  });
-  GeneratedLayout result;
-  std::vector<ModuleCandidate> selected;
-  for (auto& candidate : candidates) {
-    bool valid = true;
-    for (auto& cell : candidate.cells) {
-      if (!conform_shell_cell(cell, placement_scene, complete_trace_scene, grid)) {
-        valid = false;
-        break;
-      }
+  const float pitch_u = grid.width_m + grid.gap_m;
+  const float pitch_v = grid.height_m + grid.gap_m;
+  const float step = static_cast<float>(std::min({settings.position_step_m,
+      static_cast<double>(grid.width_m), static_cast<double>(grid.height_m)}) / 8.0);
+  const float start_z = bounds.maximum.z + 1.0f;
+  const double x_count = std::ceil(bounds.extent().x / step) + 3;
+  const double y_count = std::ceil(bounds.extent().y / step) + 3;
+  if (!(step > 0) || !(grid.width_m > 0) || !(grid.height_m > 0) ||
+      !std::isfinite(grid.gap_m) || grid.gap_m < 0 ||
+      !(x_count >= 3 && y_count >= 3 && x_count * y_count <= 2000000) ||
+      !std::isfinite(settings.angle_step_degrees) || !(settings.angle_step_degrees > 0))
+    throw std::invalid_argument("Invalid shell bounds or packing resolution; increase position step");
+  const int nx = static_cast<int>(x_count), ny = static_cast<int>(y_count);
+  const auto index = [nx](int x, int y) { return y * nx + x; };
+  const Vec3 origin = bounds.minimum - Vec3{step, step, 0};
+  std::vector<float> depth(static_cast<std::size_t>(nx) * ny, 0.0f);
+  // Sample the projected eligible footprint, including openings. The distance
+  // field only guides placement; the 3D mesh still decides whether cells fit.
+  for (int y = 1; y < ny - 1; ++y) for (int x = 1; x < nx - 1; ++x) {
+    const auto hit = top_hit(placement_scene, origin.x + x*step, origin.y + y*step, start_z);
+    if (hit && in_bounds(hit->point, region.minimum, region.maximum) &&
+        hit->normal.z >= std::max(grid.minimum_upward_normal_z, region.minimum_upward_normal_z) &&
+        (!region.use_canopy_exclusion || !in_bounds(hit->point, region.exclusion_minimum, region.exclusion_maximum)))
+      depth[index(x,y)] = std::numeric_limits<float>::infinity();
+  }
+  const float diagonal = step * std::sqrt(2.0f);
+  for (int sign : {1, -1}) {
+    for (int iy = 1; iy < ny - 1; ++iy) for (int ix = 1; ix < nx - 1; ++ix) {
+      const int x = sign > 0 ? ix : nx-1-ix, y = sign > 0 ? iy : ny-1-iy;
+      auto& d = depth[index(x,y)];
+      d = std::min({d, depth[index(x-sign,y)] + step, depth[index(x,y-sign)] + step,
+          depth[index(x-1,y-sign)] + diagonal, depth[index(x+1,y-sign)] + diagonal});
     }
-    if (!valid) continue;
-    for (std::size_t i = 0; i < candidate.cells.size() && valid; ++i)
-      for (std::size_t j = 0; j < i; ++j)
-        if (overlaps(candidate.cells[i], candidate.cells[j], grid.gap_m)) { valid = false; break; }
-    if (!valid) continue;
-    for (const auto& prior : selected)
-      if (modules_conflict(candidate, prior, grid.gap_m)) { valid = false; break; }
-    if (!valid) continue;
-    const auto columns = candidate.cells.size() == 6 ? 2U : 1U;
+  }
+  GeneratedLayout result;
+  struct Placement { Bounds footprint; ModuleCandidate module; };
+  std::vector<Placement> selected;
+  const auto place = [&](Vec3 anchor, float yaw, std::uint32_t columns) {
+    const Vec3 u{std::cos(yaw), std::sin(yaw), 0}, v{-u.y, u.x, 0};
+    ModuleCandidate candidate;
+    Bounds footprint;
+    for (int row = 0; row < 3; ++row) for (std::uint32_t col = 0; col < columns; ++col) {
+      const Vec3 p = anchor + u * ((col - 0.5f*(columns-1))*pitch_u) + v * ((row-1)*pitch_v);
+      auto cell = supported_cell(placement_scene, p.x, p.y, start_z, grid, region, yaw, true);
+      if (!cell || !conform_shell_cell(*cell, placement_scene, complete_trace_scene, grid)) return false;
+      for (const auto& other : candidate.cells)
+        if (overlaps(*cell, other, grid.gap_m)) return false;
+      for (const auto& corner : projected_corners(*cell)) footprint.include(corner);
+      candidate.cells.push_back(*cell);
+    }
+    for (const auto& prior : selected) {
+      // Skip module pairs that are already farther apart than the gap in X or Y.
+      const float pad = 2*grid.gap_m;
+      if (footprint.maximum.x + pad < prior.footprint.minimum.x ||
+          prior.footprint.maximum.x + pad < footprint.minimum.x ||
+          footprint.maximum.y + pad < prior.footprint.minimum.y ||
+          prior.footprint.maximum.y + pad < footprint.minimum.y) continue;
+      if (modules_conflict(candidate, prior.module, grid.gap_m)) return false;
+    }
     const auto id = static_cast<std::uint32_t>(selected.size() + 1);
     for (std::size_t i = 0; i < candidate.cells.size(); ++i) {
-      auto cell = candidate.cells[i];
+      auto& cell = candidate.cells[i];
       cell.module_id = id; cell.module_rows = 3; cell.module_columns = columns;
       cell.row = static_cast<std::uint32_t>(i / columns);
       cell.column = static_cast<std::uint32_t>(i % columns);
@@ -583,8 +612,95 @@ GeneratedLayout pack_shell_center_outward(
     }
     if (columns == 2) ++result.summary.two_by_three_modules;
     else ++result.summary.one_by_three_modules;
-    selected.push_back(std::move(candidate));
+    selected.push_back({footprint, std::move(candidate)});
+    return true;
+  };
+  // The supplied shell has a broad rectangular tail and a narrow rounded nose.
+  // Compare near-end widths so the walk starts at the tail even if Y is flipped.
+  const int end_rows = std::clamp(static_cast<int>(std::ceil(std::min(pitch_v/step, static_cast<float>(ny-2)))), 1, ny-2);
+  const auto end_width = [&](bool high) {
+    int widest = 0;
+    for (int k = 1; k <= end_rows; ++k) {
+      const int y = high ? ny-1-k : k;
+      int left = nx, right = -1;
+      for (int x = 1; x < nx-1; ++x) if (depth[index(x,y)] > 0) { left = std::min(left, x); right = x; }
+      widest = std::max(widest, right-left+1);
+    }
+    return widest;
+  };
+  const bool rear_at_high_y = end_width(true) >= end_width(false);
+  const float yaw_adjustment = static_cast<float>(std::min(settings.angle_step_degrees, 15.0)) * kPi / 180.0f;
+  const auto fill_contour = [&](float inset, std::uint32_t columns) {
+    // Extract oriented edges of the inset footprint. Interior is on the left.
+    // Scan from the rear, low X first, to seed the walk at the rear-left end.
+    const float threshold = inset + step * 0.5f;
+    const auto inside = [&](int x, int y) { return depth[index(x,y)] >= threshold; };
+    constexpr std::array<int, 4> dx{1, 0, -1, 0}, dy{0, 1, 0, -1};
+    std::vector<unsigned char> edges(depth.size());
+    for (int y = 1; y < ny-1; ++y) for (int x = 1; x < nx-1; ++x) {
+      if (!inside(x,y)) continue;
+      if (!inside(x,y-1)) edges[index(x,y)] |= 1U;
+      if (!inside(x+1,y)) edges[index(x+1,y)] |= 2U;
+      if (!inside(x,y+1)) edges[index(x+1,y+1)] |= 4U;
+      if (!inside(x-1,y)) edges[index(x,y+1)] |= 8U;
+    }
+    for (int row = 1; row < ny; ++row) for (int sx = 1; sx < nx; ++sx) {
+      const int sy = rear_at_high_y ? ny-row : row;
+      while (edges[index(sx,sy)]) {
+        std::vector<Vec3> loop;
+        int x = sx, y = sy, direction = 0;
+        while (!(edges[index(x,y)] & (1U << direction))) ++direction;
+        do {
+          loop.push_back({origin.x + (x-0.5f)*step, origin.y + (y-0.5f)*step, 0});
+          edges[index(x,y)] &= static_cast<unsigned char>(~(1U << direction));
+          x += dx[direction]; y += dy[direction];
+          const auto next = edges[index(x,y)];
+          if (!next) break;
+          // At diagonal contacts, follow the same component instead of crossing.
+          for (int turn : {1, 0, 3, 2}) {
+            const int d = (direction+turn)%4;
+            if (next & (1U << d)) { direction = d; break; }
+          }
+        } while (x != sx || y != sy);
+        const float perimeter = static_cast<float>(loop.size()) * step;
+        if (x != sx || y != sy || perimeter < 3*pitch_v) continue;
+        const auto point_at = [&](float s) {
+          s = std::fmod(s, perimeter);
+          if (s < 0) s += perimeter;
+          const float f = s / step;
+          const auto i = std::min(static_cast<std::size_t>(f), loop.size()-1);
+          return loop[i] + (loop[(i+1)%loop.size()] - loop[i]) * std::clamp(f-static_cast<float>(i), 0.0f, 1.0f);
+        };
+        const float half_span = std::min(1.5f*pitch_v, perimeter*0.125f);
+        for (float s = 0; s < perimeter;) {
+          const Vec3 tangent = point_at(s+half_span) - point_at(s-half_span);
+          if (std::hypot(tangent.x,tangent.y) < step) { s += step; continue; }
+          const float heading = std::atan2(tangent.y,tangent.x);
+          const Vec3 inward{-std::sin(heading), std::cos(heading), 0};
+          bool placed = false;
+          for (float nudge : {0.0f, 0.5f, 1.0f}) {
+            for (float angle : {0.0f, -0.5f, 0.5f, -1.0f, 1.0f}) {
+              if (place(point_at(s) + inward*(nudge*step), heading - kPi*0.5f + angle*yaw_adjustment, columns)) {
+                placed = true; break;
+              }
+            }
+            if (placed) break;
+          }
+          s += placed ? 3*pitch_v : step;
+        }
+      }
+    }
+  };
+  const float max_depth = *std::max_element(depth.begin(), depth.end());
+  for (float band = 0; band + grid.width_m * 0.5f < max_depth; band += 2*pitch_u) {
+    fill_contour(band + pitch_u * 0.5f + grid.width_m * 0.5f, 2);
+    fill_contour(band + grid.width_m * 0.5f, 1);
+    fill_contour(band + pitch_u + grid.width_m * 0.5f, 1);
   }
+  // Try staggered narrow contours after the main bands. Near a curve or a
+  // split in the footprint, a leftover pocket need not line up with a lane.
+  for (float inset = (grid.width_m + pitch_u)*0.5f; inset < max_depth; inset += pitch_u)
+    fill_contour(inset, 1);
   result.summary.individual_cells = result.cells.size();
   return result;
 }

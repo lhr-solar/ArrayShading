@@ -1108,11 +1108,11 @@ void show_viewer(std::shared_ptr<const ViewerCar> car,
         const auto grid_snapshot = grid;
         const auto packing_settings = optimization_settings(*race_config);
         packing_future = std::async(std::launch::async, [top_snapshot, car_snapshot, grid_snapshot, packing_settings] {
-          return pack_shell_center_outward(top_snapshot->scene, top_snapshot->surface.mesh.bounds,
+          return pack_shell_perimeter_inward(top_snapshot->scene, top_snapshot->surface.mesh.bounds,
               car_snapshot->scene, grid_snapshot, top_snapshot->surface.region, packing_settings);
         });
         packing_running = true;
-        packing_status = "Packing 2x3 modules, then 1x3 modules from the shell center outward...";
+        packing_status = "Following the shell outline inward, trying 2x3 modules and filling with 1x3s...";
       }
       ImGui::EndDisabled();
       if (!packing_status.empty()) ImGui::TextWrapped("%s", packing_status.c_str());

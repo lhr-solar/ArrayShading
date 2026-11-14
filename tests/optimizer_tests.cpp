@@ -1,4 +1,5 @@
 #include "solar/optimizer.hpp"
+#include "solar/placement_surface.hpp"
 
 #include <cmath>
 #include <iostream>
@@ -183,8 +184,8 @@ void shell_packing_is_deterministic_and_supported() {
   settings.position_step_m = 0.256;
   settings.angle_step_degrees = 90;
   settings.max_active_area_m2 = 0.01;  // Full-shell preview ignores this cap.
-  const auto a = solar::pack_shell_center_outward(scene, mesh.bounds, scene, grid, region, settings);
-  const auto b = solar::pack_shell_center_outward(scene, mesh.bounds, scene, grid, region, settings);
+  const auto a = solar::pack_shell_perimeter_inward(scene, mesh.bounds, scene, grid, region, settings);
+  const auto b = solar::pack_shell_perimeter_inward(scene, mesh.bounds, scene, grid, region, settings);
   require(!a.cells.empty() && a.cells.size() == b.cells.size(),
           "full-shell packing must produce a deterministic layout independent of the race area cap");
   require(a.summary.two_by_three_modules > 0 &&
@@ -195,6 +196,40 @@ void shell_packing_is_deterministic_and_supported() {
     require(a.cells[i].module_rows == 3 && (a.cells[i].module_columns == 1 || a.cells[i].module_columns == 2),
             "packing must retain complete module metadata");
   }
+}
+
+void perimeter_packing_follows_the_rounded_nose() {
+  // Flat shell with a wide, square tail at +Y and a semicircular nose at -Y.
+  solar::TriangleMesh mesh;
+  const auto triangle = [&](solar::Vec3 a, solar::Vec3 b, solar::Vec3 c) {
+    for (const auto p : {a, b, c}) { mesh.vertices.push_back(p); mesh.bounds.include(p); }
+  };
+  triangle({-1,0,0.5f}, {1,0,0.5f}, {1,1.5f,0.5f});
+  triangle({-1,0,0.5f}, {1,1.5f,0.5f}, {-1,1.5f,0.5f});
+  solar::Vec3 previous{-1,0,0.5f};
+  for (int i = 1; i <= 32; ++i) {
+    const float angle = solar::kPi * (1.0f + i / 32.0f);
+    const solar::Vec3 next{std::cos(angle), std::sin(angle), 0.5f};
+    triangle({0,0,0.5f}, previous, next);
+    previous = next;
+  }
+  solar::TraceScene scene(mesh);
+  solar::CellGrid grid;
+  solar::ShellRegion region;
+  region.minimum = {-1,-1,0}; region.maximum = {1,1.5f,1};
+  region.use_canopy_exclusion = false;
+  const auto packed = solar::pack_shell_perimeter_inward(scene, mesh.bounds, scene, grid, region, {});
+  require(!packed.cells.empty() && packed.cells.front().center.y > 0.8f,
+          "perimeter packing should start at the broad rear end");
+  bool follows_curve = false;
+  for (const auto& cell : packed.cells) {
+    require(solar::validate_shell_cell(cell, scene, scene, grid), "contour cell must remain on the actual surface");
+    const solar::Vec3 radial{cell.center.x, cell.center.y, 0};
+    if (cell.center.y < -0.25f && std::abs(cell.v_axis.x) > 0.2f && std::abs(cell.v_axis.y) > 0.2f &&
+        std::abs(solar::dot(solar::normalized(radial), cell.v_axis)) < 0.3f)
+      follows_curve = true;
+  }
+  require(follows_curve, "rounded nose should receive modules oriented along the local contour");
 }
 
 void track_profiles_preserve_each_sample_and_cell() {
@@ -410,6 +445,7 @@ int main() {
     packing_matches_exhaustive_small_cases();
     arbitrary_sampled_rotation_is_supported();
     shell_packing_is_deterministic_and_supported();
+    perimeter_packing_follows_the_rounded_nose();
     track_profiles_preserve_each_sample_and_cell();
     zone_grouping_follows_profiles_and_requires_connectivity();
     exclusion_region_rejects_canopy_area();
